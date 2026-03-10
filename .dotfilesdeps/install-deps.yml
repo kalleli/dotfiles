@@ -1,0 +1,192 @@
+---
+- name: Install dotfiles dependencies
+  hosts: "{{ target | default('localhost') }}"
+  connection: local
+  gather_facts: true
+
+  vars:
+    dotfiles_common_packages:
+      - git
+      - curl
+      - fzf
+      - zoxide
+      - zsh
+    dotfiles_macos_extra_packages: []
+    dotfiles_debian_extra_packages: []
+    terminal_font_family: JetBrains Mono
+    terminal_font_size: 13
+    terminal_font_macos_name: JetBrains Mono Regular
+    oh_my_posh_arch_map:
+      x86_64: amd64
+      amd64: amd64
+      aarch64: arm64
+      arm64: arm64
+
+  tasks:
+    - name: Install dependencies on macOS with Homebrew
+      when: ansible_system == 'Darwin'
+      block:
+        - name: Ensure Homebrew is installed
+          ansible.builtin.command: brew --version
+          register: brew_check
+          changed_when: false
+
+        - name: Tap oh-my-posh Homebrew repository
+          ansible.builtin.command: brew tap jandedobbeleer/oh-my-posh
+          register: brew_tap
+          changed_when: "'already tapped' not in (((brew_tap.stdout | default('')) ~ (brew_tap.stderr | default(''))) | lower)"
+
+        - name: Tap Homebrew fonts repository
+          ansible.builtin.command: brew tap homebrew/cask-fonts
+          register: brew_font_tap
+          changed_when: "'already tapped' not in (((brew_font_tap.stdout | default('')) ~ (brew_font_tap.stderr | default(''))) | lower)"
+
+        - name: Install Homebrew packages
+          ansible.builtin.command: "brew install {{ item }}"
+          loop: "{{ dotfiles_common_packages + dotfiles_macos_extra_packages + ['jandedobbeleer/oh-my-posh/oh-my-posh'] }}"
+          register: brew_install
+          changed_when: "'already installed' not in (((stdout | default('')) ~ (stderr | default(''))) | lower)"
+
+        - name: Install JetBrains Mono font on macOS
+          ansible.builtin.command: brew install --cask font-jetbrains-mono
+          register: brew_install_jetbrains_mono
+          changed_when: "'already installed' not in (((brew_install_jetbrains_mono.stdout | default('')) ~ (brew_install_jetbrains_mono.stderr | default(''))) | lower)"
+
+        - name: Configure Terminal.app font
+          when: ansible_env.TERM_PROGRAM | default('') == 'Apple_Terminal'
+          ansible.builtin.shell: |
+            osascript <<'APPLESCRIPT'
+            tell application "Terminal"
+              set font name of default settings to "{{ terminal_font_macos_name }}"
+              set font size of default settings to {{ terminal_font_size }}
+              set font name of startup settings to "{{ terminal_font_macos_name }}"
+              set font size of startup settings to {{ terminal_font_size }}
+            end tell
+            APPLESCRIPT
+          args:
+            executable: /bin/bash
+          changed_when: true
+
+        - name: Configure iTerm2 font
+          when: ansible_env.TERM_PROGRAM | default('') == 'iTerm.app'
+          ansible.builtin.command:
+            argv:
+              - defaults
+              - write
+              - com.googlecode.iterm2
+              - Normal Font
+              - -string
+              - "JetBrainsMono-Regular {{ terminal_font_size }}"
+          changed_when: true
+
+    - name: Install dependencies on Debian/Ubuntu
+      when: ansible_os_family == 'Debian'
+      become: true
+      block:
+        - name: Install apt packages
+          ansible.builtin.apt:
+            name: "{{ dotfiles_common_packages + dotfiles_debian_extra_packages + ['ca-certificates', 'fonts-jetbrains-mono'] }}"
+            state: present
+            update_cache: true
+
+        - name: Resolve oh-my-posh architecture
+          ansible.builtin.set_fact:
+            oh_my_posh_arch: "{{ oh_my_posh_arch_map.get(ansible_architecture, '') }}"
+
+        - name: Fail for unsupported Linux architecture
+          ansible.builtin.fail:
+            msg: "Unsupported architecture for oh-my-posh: {{ ansible_architecture }}"
+          when: oh_my_posh_arch == ''
+
+        - name: Install oh-my-posh binary
+          ansible.builtin.get_url:
+            url: "https://github.com/JanDeDobbeleer/oh-my-posh/releases/latest/download/posh-linux-{{ oh_my_posh_arch }}"
+            dest: /usr/local/bin/oh-my-posh
+            mode: '0755'
+
+    - name: Configure GNOME Terminal font on Debian/Ubuntu
+      when: ansible_os_family == 'Debian'
+      block:
+        - name: Check for gsettings
+          ansible.builtin.command: gsettings --version
+          register: gsettings_check
+          changed_when: false
+          failed_when: false
+
+        - name: Get GNOME Terminal default profile id
+          when: gsettings_check.rc == 0
+          ansible.builtin.command:
+            argv:
+              - gsettings
+              - get
+              - org.gnome.Terminal.ProfilesList
+              - default
+          register: gnome_terminal_default_profile
+          changed_when: false
+          failed_when: false
+
+        - name: Set GNOME Terminal default profile id fact
+          when:
+            - gsettings_check.rc == 0
+            - gnome_terminal_default_profile.rc == 0
+          ansible.builtin.set_fact:
+            gnome_terminal_profile_id: "{{ gnome_terminal_default_profile.stdout | trim | regex_replace(\"'\", '') }}"
+
+        - name: Read GNOME Terminal use-system-font value
+          when: gnome_terminal_profile_id is defined
+          ansible.builtin.command:
+            argv:
+              - gsettings
+              - get
+              - "org.gnome.Terminal.Legacy.Profile:/org/gnome/terminal/legacy/profiles:/:{{ gnome_terminal_profile_id }}/"
+              - use-system-font
+          register: gnome_terminal_use_system_font
+          changed_when: false
+          failed_when: false
+
+        - name: Disable GNOME Terminal system font
+          when:
+            - gnome_terminal_profile_id is defined
+            - gnome_terminal_use_system_font.rc == 0
+            - gnome_terminal_use_system_font.stdout | trim != 'false'
+          ansible.builtin.command:
+            argv:
+              - gsettings
+              - set
+              - "org.gnome.Terminal.Legacy.Profile:/org/gnome/terminal/legacy/profiles:/:{{ gnome_terminal_profile_id }}/"
+              - use-system-font
+              - "false"
+          changed_when: true
+
+        - name: Read GNOME Terminal font value
+          when: gnome_terminal_profile_id is defined
+          ansible.builtin.command:
+            argv:
+              - gsettings
+              - get
+              - "org.gnome.Terminal.Legacy.Profile:/org/gnome/terminal/legacy/profiles:/:{{ gnome_terminal_profile_id }}/"
+              - font
+          register: gnome_terminal_font
+          changed_when: false
+          failed_when: false
+
+        - name: Set GNOME Terminal font
+          when:
+            - gnome_terminal_profile_id is defined
+            - gnome_terminal_font.rc == 0
+            - gnome_terminal_font.stdout | trim != "'" ~ terminal_font_family ~ " " ~ (terminal_font_size | string) ~ "'"
+          ansible.builtin.command:
+            argv:
+              - gsettings
+              - set
+              - "org.gnome.Terminal.Legacy.Profile:/org/gnome/terminal/legacy/profiles:/:{{ gnome_terminal_profile_id }}/"
+              - font
+              - "{{ terminal_font_family }} {{ terminal_font_size }}"
+          changed_when: true
+
+    - name: Fail on unsupported operating system
+      when: ansible_system != 'Darwin' and ansible_os_family != 'Debian'
+      ansible.builtin.fail:
+        msg: >-
+          Unsupported OS family/system: {{ ansible_os_family }} / {{ ansible_system }}.
+          This playbook supports macOS and Debian/Ubuntu.
