@@ -1,0 +1,367 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DOTFILES_DIR="${DOTFILES_DIR:-$HOME/.dotfiles}"
+DOTFILES_WORK_TREE="${DOTFILES_WORK_TREE:-$HOME}"
+DOTFILES_REMOTE_URL="${DOTFILES_REMOTE_URL:-}"
+FONT_FAMILY="${FONT_FAMILY:-JetBrains Mono}"
+FONT_SIZE="${FONT_SIZE:-13}"
+MACOS_TERMINAL_FONT_NAME="${MACOS_TERMINAL_FONT_NAME:-JetBrains Mono Regular}"
+
+APT_UPDATED=0
+
+log() {
+  printf '[bootstrap] %s\n' "$*"
+}
+
+warn() {
+  printf '[bootstrap] WARNING: %s\n' "$*" >&2
+}
+
+fail() {
+  printf '[bootstrap] ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || fail "Missing required command: $1"
+}
+
+ensure_local_bin() {
+  mkdir -p "$HOME/.local/bin"
+}
+
+sudo_if_needed() {
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    "$@"
+  else
+    need_cmd sudo
+    sudo "$@"
+  fi
+}
+
+install_apt_missing_packages() {
+  local missing=()
+  local pkg
+
+  for pkg in "$@"; do
+    if ! dpkg -s "$pkg" >/dev/null 2>&1; then
+      missing+=("$pkg")
+    fi
+  done
+
+  if (( ${#missing[@]} == 0 )); then
+    log "APT dependencies already installed"
+    return
+  fi
+
+  if (( APT_UPDATED == 0 )); then
+    log "Updating apt package index"
+    sudo_if_needed apt-get update
+    APT_UPDATED=1
+  fi
+
+  log "Installing apt packages: ${missing[*]}"
+  sudo_if_needed apt-get install -y "${missing[@]}"
+}
+
+is_debian_like() {
+  [[ -f /etc/os-release ]] || return 1
+
+  # shellcheck disable=SC1091
+  . /etc/os-release
+
+  [[ "${ID:-}" == "debian" || "${ID:-}" == "ubuntu" || "${ID_LIKE:-}" == *"debian"* ]]
+}
+
+refresh_brew_path() {
+  if [[ -x /opt/homebrew/bin/brew ]]; then
+    eval "$(/opt/homebrew/bin/brew shellenv)"
+  elif [[ -x /usr/local/bin/brew ]]; then
+    eval "$(/usr/local/bin/brew shellenv)"
+  fi
+}
+
+ensure_homebrew() {
+  if command -v brew >/dev/null 2>&1; then
+    refresh_brew_path
+    return
+  fi
+
+  log "Installing Homebrew"
+  NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+  refresh_brew_path
+  command -v brew >/dev/null 2>&1 || fail "Homebrew install completed but brew was not found on PATH"
+}
+
+ensure_brew_tap() {
+  local tap="$1"
+
+  if brew tap | grep -Fxq "$tap"; then
+    return
+  fi
+
+  log "Tapping brew repo: $tap"
+  brew tap "$tap"
+}
+
+ensure_brew_formula() {
+  local install_name="$1"
+  local check_name="${2:-$1}"
+
+  if brew list --formula "$check_name" >/dev/null 2>&1; then
+    return
+  fi
+
+  log "Installing brew formula: $install_name"
+  brew install "$install_name"
+}
+
+ensure_brew_cask() {
+  local cask="$1"
+
+  if brew list --cask "$cask" >/dev/null 2>&1; then
+    return
+  fi
+
+  log "Installing brew cask: $cask"
+  brew install --cask "$cask"
+}
+
+configure_macos_terminal_font() {
+  local term_program="${TERM_PROGRAM:-}"
+
+  case "$term_program" in
+    Apple_Terminal)
+      if ! command -v osascript >/dev/null 2>&1; then
+        warn "osascript not found; skipping Terminal.app font configuration"
+        return
+      fi
+
+      log "Configuring Terminal.app font"
+      osascript <<APPLESCRIPT >/dev/null
+ tell application "Terminal"
+   set font name of default settings to "${MACOS_TERMINAL_FONT_NAME}"
+   set font size of default settings to ${FONT_SIZE}
+   set font name of startup settings to "${MACOS_TERMINAL_FONT_NAME}"
+   set font size of startup settings to ${FONT_SIZE}
+ end tell
+APPLESCRIPT
+      ;;
+    iTerm.app)
+      local target_font="JetBrainsMono-Regular ${FONT_SIZE}"
+      local current_font
+      current_font="$(defaults read com.googlecode.iterm2 'Normal Font' 2>/dev/null || true)"
+
+      if [[ "$current_font" != "$target_font" ]]; then
+        log "Configuring iTerm2 font"
+        defaults write com.googlecode.iterm2 'Normal Font' -string "$target_font"
+      fi
+      ;;
+    *)
+      warn "TERM_PROGRAM is not Terminal.app or iTerm2; skipping terminal font setup on macOS"
+      ;;
+  esac
+}
+
+install_macos_dependencies() {
+  ensure_homebrew
+  ensure_brew_tap jandedobbeleer/oh-my-posh
+  ensure_brew_tap homebrew/cask-fonts
+
+  ensure_brew_formula git
+  ensure_brew_formula curl
+  ensure_brew_formula fzf
+  ensure_brew_formula zoxide
+  ensure_brew_formula zsh
+  ensure_brew_formula jandedobbeleer/oh-my-posh/oh-my-posh oh-my-posh
+  ensure_brew_cask font-jetbrains-mono
+  ensure_brew_cask ghostty
+
+  configure_macos_terminal_font
+}
+
+linux_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64)
+      printf 'amd64\n'
+      ;;
+    arm64|aarch64)
+      printf 'arm64\n'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+ensure_oh_my_posh_linux() {
+  if command -v oh-my-posh >/dev/null 2>&1; then
+    return
+  fi
+
+  local arch
+  arch="$(linux_arch)" || fail "Unsupported CPU architecture for oh-my-posh: $(uname -m)"
+
+  local tmp_file
+  tmp_file="$(mktemp)"
+
+  log "Installing oh-my-posh to $HOME/.local/bin/oh-my-posh"
+  curl -fsSL "https://github.com/JanDeDobbeleer/oh-my-posh/releases/latest/download/posh-linux-${arch}" -o "$tmp_file"
+  install -m 0755 "$tmp_file" "$HOME/.local/bin/oh-my-posh"
+  rm -f "$tmp_file"
+}
+
+ensure_zoxide_linux() {
+  if command -v zoxide >/dev/null 2>&1; then
+    return
+  fi
+
+  if apt-cache show zoxide >/dev/null 2>&1; then
+    install_apt_missing_packages zoxide
+    return
+  fi
+
+  log "Installing zoxide to $HOME/.local/bin via upstream installer"
+  curl -fsSL https://raw.githubusercontent.com/ajeetdsouza/zoxide/main/install.sh | bash -s -- --bin-dir "$HOME/.local/bin"
+}
+
+ensure_ghostty_linux() {
+  if command -v ghostty >/dev/null 2>&1; then
+    return
+  fi
+
+  if apt-cache show ghostty >/dev/null 2>&1; then
+    install_apt_missing_packages ghostty
+    return
+  fi
+
+  warn "ghostty package not found in apt repositories; skipping ghostty install on Debian/Ubuntu"
+}
+
+configure_gnome_terminal_font() {
+  if ! command -v gsettings >/dev/null 2>&1; then
+    warn "gsettings not found; skipping GNOME Terminal font configuration"
+    return
+  fi
+
+  if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" && -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
+    warn "No desktop session detected; skipping GNOME Terminal font configuration"
+    return
+  fi
+
+  local profile
+  profile="$(gsettings get org.gnome.Terminal.ProfilesList default 2>/dev/null | tr -d "'" || true)"
+
+  if [[ -z "$profile" ]]; then
+    warn "Could not determine GNOME Terminal default profile; skipping font configuration"
+    return
+  fi
+
+  local schema
+  schema="org.gnome.Terminal.Legacy.Profile:/org/gnome/terminal/legacy/profiles:/:${profile}/"
+
+  local desired_font
+  desired_font="${FONT_FAMILY} ${FONT_SIZE}"
+
+  local use_system_font
+  use_system_font="$(gsettings get "$schema" use-system-font 2>/dev/null || true)"
+  if [[ "$use_system_font" != "false" ]]; then
+    log "Disabling GNOME Terminal system font"
+    gsettings set "$schema" use-system-font false
+  fi
+
+  local current_font
+  current_font="$(gsettings get "$schema" font 2>/dev/null | tr -d "'" || true)"
+  if [[ "$current_font" != "$desired_font" ]]; then
+    log "Setting GNOME Terminal font to ${desired_font}"
+    gsettings set "$schema" font "$desired_font"
+  fi
+}
+
+install_debian_dependencies() {
+  need_cmd apt-get
+  need_cmd dpkg
+
+  install_apt_missing_packages git curl fzf zsh ca-certificates fonts-jetbrains-mono
+  ensure_zoxide_linux
+  ensure_oh_my_posh_linux
+  ensure_ghostty_linux
+  configure_gnome_terminal_font
+}
+
+dotfiles_git() {
+  /usr/bin/git --git-dir="$DOTFILES_DIR" --work-tree="$DOTFILES_WORK_TREE" "$@"
+}
+
+ensure_dotfiles_repo() {
+  need_cmd git
+
+  if [[ -d "$DOTFILES_DIR" ]]; then
+    if ! /usr/bin/git --git-dir="$DOTFILES_DIR" rev-parse --is-bare-repository >/dev/null 2>&1; then
+      fail "$DOTFILES_DIR exists but is not a bare git repository"
+    fi
+    log "Using existing bare dotfiles repo at $DOTFILES_DIR"
+  else
+    [[ -n "$DOTFILES_REMOTE_URL" ]] || fail "Set DOTFILES_REMOTE_URL to clone dotfiles into $DOTFILES_DIR"
+    log "Cloning bare dotfiles repo: $DOTFILES_REMOTE_URL"
+    /usr/bin/git clone --bare "$DOTFILES_REMOTE_URL" "$DOTFILES_DIR"
+  fi
+
+  local current_origin
+  current_origin="$(/usr/bin/git --git-dir="$DOTFILES_DIR" remote get-url origin 2>/dev/null || true)"
+
+  if [[ -n "$DOTFILES_REMOTE_URL" ]]; then
+    if [[ -z "$current_origin" ]]; then
+      log "Adding origin remote: $DOTFILES_REMOTE_URL"
+      /usr/bin/git --git-dir="$DOTFILES_DIR" remote add origin "$DOTFILES_REMOTE_URL"
+      current_origin="$DOTFILES_REMOTE_URL"
+    elif [[ "$current_origin" != "$DOTFILES_REMOTE_URL" ]]; then
+      log "Updating origin remote: $DOTFILES_REMOTE_URL"
+      /usr/bin/git --git-dir="$DOTFILES_DIR" remote set-url origin "$DOTFILES_REMOTE_URL"
+      current_origin="$DOTFILES_REMOTE_URL"
+    fi
+  fi
+
+  if [[ -n "$current_origin" ]]; then
+    log "Fetching latest dotfiles changes"
+    /usr/bin/git --git-dir="$DOTFILES_DIR" fetch --prune origin
+  else
+    warn "No origin remote found for $DOTFILES_DIR; skipping fetch"
+  fi
+
+  local checkout_output
+  if ! checkout_output="$(dotfiles_git checkout 2>&1)"; then
+    printf '%s\n' "$checkout_output" >&2
+    fail "Dotfiles checkout failed. Resolve conflicts in $DOTFILES_WORK_TREE and rerun."
+  fi
+
+  dotfiles_git config --local status.showUntrackedFiles no
+  log "Dotfiles checkout is up to date"
+}
+
+main() {
+  ensure_local_bin
+
+  case "$(uname -s)" in
+    Darwin)
+      install_macos_dependencies
+      ;;
+    Linux)
+      if is_debian_like; then
+        install_debian_dependencies
+      else
+        fail "Unsupported Linux distro. This script supports Debian/Ubuntu."
+      fi
+      ;;
+    *)
+      fail "Unsupported OS: $(uname -s). This script supports macOS and Debian/Ubuntu."
+      ;;
+  esac
+
+  ensure_dotfiles_repo
+
+  log "All done"
+}
+
+main "$@"
