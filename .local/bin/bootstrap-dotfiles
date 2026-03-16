@@ -4,11 +4,17 @@ set -euo pipefail
 DOTFILES_DIR="${DOTFILES_DIR:-$HOME/.dotfiles}"
 DOTFILES_WORK_TREE="${DOTFILES_WORK_TREE:-$HOME}"
 DOTFILES_REMOTE_URL="${DOTFILES_REMOTE_URL:-}"
+DOTFILES_BACKUP_ROOT="${DOTFILES_BACKUP_ROOT:-$HOME/.dotfiles-backups}"
 FONT_FAMILY="${FONT_FAMILY:-JetBrains Mono}"
 FONT_SIZE="${FONT_SIZE:-13}"
 MACOS_TERMINAL_FONT_NAME="${MACOS_TERMINAL_FONT_NAME:-JetBrains Mono Regular}"
+LAZYVIM_INSTALL="${LAZYVIM_INSTALL:-1}"
+LAZYVIM_CONFIG_DIR="${LAZYVIM_CONFIG_DIR:-$HOME/.config/nvim}"
+LAZYVIM_STARTER_REPO="${LAZYVIM_STARTER_REPO:-https://github.com/LazyVim/starter.git}"
+LAZYVIM_NEOVIM_MIN_VERSION="${LAZYVIM_NEOVIM_MIN_VERSION:-0.11.2}"
 
 APT_UPDATED=0
+LAST_DOTFILES_BACKUP_DIR=""
 
 log() {
   printf '[bootstrap] %s\n' "$*"
@@ -25,6 +31,64 @@ fail() {
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || fail "Missing required command: $1"
+}
+
+version_ge() {
+  local version_a="${1#v}"
+  local version_b="${2#v}"
+
+  awk -v a="$version_a" -v b="$version_b" '
+    BEGIN {
+      a_count = split(a, av, ".")
+      b_count = split(b, bv, ".")
+      max_count = (a_count > b_count ? a_count : b_count)
+
+      for (i = 1; i <= max_count; i++) {
+        a_part = (i in av ? av[i] : "0")
+        b_part = (i in bv ? bv[i] : "0")
+        sub(/[^0-9].*$/, "", a_part)
+        sub(/[^0-9].*$/, "", b_part)
+        if (a_part == "") {
+          a_part = "0"
+        }
+        if (b_part == "") {
+          b_part = "0"
+        }
+
+        a_num = a_part + 0
+        b_num = b_part + 0
+        if (a_num > b_num) {
+          exit 0
+        }
+        if (a_num < b_num) {
+          exit 1
+        }
+      }
+
+      exit 0
+    }
+  '
+}
+
+current_nvim_version() {
+  local nvim_bin
+
+  if [[ -x "$HOME/.local/bin/nvim" ]]; then
+    nvim_bin="$HOME/.local/bin/nvim"
+  elif command -v nvim >/dev/null 2>&1; then
+    nvim_bin="$(command -v nvim)"
+  else
+    return 1
+  fi
+
+  "$nvim_bin" --version 2>/dev/null | awk 'NR == 1 { print $2; exit }' | sed 's/^v//'
+}
+
+nvim_meets_min_version() {
+  local current_version
+  current_version="$(current_nvim_version || true)"
+  [[ -n "$current_version" ]] || return 1
+  version_ge "$current_version" "$LAZYVIM_NEOVIM_MIN_VERSION"
 }
 
 ensure_local_bin() {
@@ -105,6 +169,17 @@ ensure_brew_tap() {
   brew tap "$tap"
 }
 
+cleanup_deprecated_brew_taps() {
+  local tap
+
+  for tap in homebrew/cask-fonts homebrew/homebrew-cask-fonts; do
+    if brew tap | grep -Fxq "$tap"; then
+      log "Untapping deprecated brew tap: $tap"
+      brew untap "$tap" || warn "Failed to untap deprecated tap: $tap"
+    fi
+  done
+}
+
 ensure_brew_formula() {
   local install_name="$1"
   local check_name="${2:-$1}"
@@ -164,20 +239,39 @@ APPLESCRIPT
   esac
 }
 
+ensure_c_compiler_macos() {
+  if command -v cc >/dev/null 2>&1; then
+    return
+  fi
+
+  warn "No C compiler found. Install Xcode Command Line Tools with: xcode-select --install"
+}
+
 install_macos_dependencies() {
   ensure_homebrew
+  cleanup_deprecated_brew_taps
   ensure_brew_tap jandedobbeleer/oh-my-posh
-  ensure_brew_tap homebrew/cask-fonts
 
   ensure_brew_formula git
   ensure_brew_formula curl
   ensure_brew_formula fzf
   ensure_brew_formula zoxide
   ensure_brew_formula zsh
+  ensure_brew_formula neovim
+  ensure_brew_formula lazygit
+  ensure_brew_formula tree-sitter
+  ensure_brew_formula ripgrep
+  ensure_brew_formula fd
   ensure_brew_formula jandedobbeleer/oh-my-posh/oh-my-posh oh-my-posh
   ensure_brew_cask font-jetbrains-mono
+  ensure_brew_cask font-jetbrains-mono-nerd-font
   ensure_brew_cask ghostty
 
+  if ! nvim_meets_min_version; then
+    fail "LazyVim requires Neovim >= $LAZYVIM_NEOVIM_MIN_VERSION, but found $(current_nvim_version || echo "none")"
+  fi
+
+  ensure_c_compiler_macos
   configure_macos_terminal_font
 }
 
@@ -226,6 +320,131 @@ ensure_zoxide_linux() {
   curl -fsSL https://raw.githubusercontent.com/ajeetdsouza/zoxide/main/install.sh | bash -s -- --bin-dir "$HOME/.local/bin"
 }
 
+neovim_linux_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64)
+      printf 'x86_64\n'
+      ;;
+    arm64|aarch64)
+      printf 'arm64\n'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+install_neovim_linux_release() {
+  local arch
+  arch="$(neovim_linux_arch)" || fail "Unsupported CPU architecture for Neovim release install: $(uname -m)"
+
+  local tmp_dir archive_file unpacked_dir target_dir
+  tmp_dir="$(mktemp -d)"
+  archive_file="${tmp_dir}/nvim-linux-${arch}.tar.gz"
+  unpacked_dir="${tmp_dir}/nvim-linux-${arch}"
+  target_dir="$HOME/.local/opt/nvim"
+
+  log "Installing Neovim from upstream release into $target_dir"
+  curl -fsSL "https://github.com/neovim/neovim/releases/latest/download/nvim-linux-${arch}.tar.gz" -o "$archive_file"
+  tar -xzf "$archive_file" -C "$tmp_dir"
+  [[ -d "$unpacked_dir" ]] || fail "Failed to unpack Neovim release archive for ${arch}"
+
+  mkdir -p "$HOME/.local/opt"
+  rm -rf "$target_dir"
+  mv "$unpacked_dir" "$target_dir"
+  ln -sfn "$target_dir/bin/nvim" "$HOME/.local/bin/nvim"
+  rm -rf "$tmp_dir"
+}
+
+ensure_neovim_linux() {
+  if nvim_meets_min_version; then
+    return
+  fi
+
+  if apt-cache show neovim >/dev/null 2>&1; then
+    install_apt_missing_packages neovim
+  fi
+
+  if nvim_meets_min_version; then
+    return
+  fi
+
+  need_cmd tar
+  install_neovim_linux_release
+
+  if ! nvim_meets_min_version; then
+    fail "LazyVim requires Neovim >= $LAZYVIM_NEOVIM_MIN_VERSION, but found $(current_nvim_version || echo "none")"
+  fi
+}
+
+ensure_lazygit_linux() {
+  if command -v lazygit >/dev/null 2>&1; then
+    return
+  fi
+
+  if apt-cache show lazygit >/dev/null 2>&1; then
+    install_apt_missing_packages lazygit
+    return
+  fi
+
+  warn "lazygit package not found in apt repositories; skipping optional lazygit dependency"
+}
+
+ensure_tree_sitter_cli_linux() {
+  if command -v tree-sitter >/dev/null 2>&1; then
+    return
+  fi
+
+  if apt-cache show tree-sitter-cli >/dev/null 2>&1; then
+    install_apt_missing_packages tree-sitter-cli
+    return
+  fi
+
+  if apt-cache show tree-sitter >/dev/null 2>&1; then
+    install_apt_missing_packages tree-sitter
+    if command -v tree-sitter >/dev/null 2>&1; then
+      return
+    fi
+  fi
+
+  if ! command -v npm >/dev/null 2>&1; then
+    if apt-cache show npm >/dev/null 2>&1; then
+      install_apt_missing_packages npm
+    fi
+  fi
+
+  if command -v npm >/dev/null 2>&1; then
+    log "Installing tree-sitter-cli via npm into $HOME/.local"
+    if npm install -g --prefix "$HOME/.local" tree-sitter-cli >/dev/null; then
+      return
+    fi
+    warn "npm install for tree-sitter-cli failed"
+  fi
+
+  warn "Could not install tree-sitter-cli automatically; install it manually for full LazyVim treesitter support"
+}
+
+ensure_fd_linux() {
+  if command -v fd >/dev/null 2>&1; then
+    return
+  fi
+
+  if ! command -v fdfind >/dev/null 2>&1; then
+    return
+  fi
+
+  local fd_target
+  fd_target="$HOME/.local/bin/fd"
+
+  if [[ -e "$fd_target" && ! -L "$fd_target" ]]; then
+    warn "$fd_target exists and is not a symlink; leaving it unchanged"
+    return
+  fi
+
+  ln -sfn "$(command -v fdfind)" "$fd_target"
+  log "Linked fd to fdfind at $fd_target"
+}
+
 ensure_ghostty_linux() {
   if command -v ghostty >/dev/null 2>&1; then
     return
@@ -237,6 +456,61 @@ ensure_ghostty_linux() {
   fi
 
   warn "ghostty package not found in apt repositories; skipping ghostty install on Debian/Ubuntu"
+}
+
+nerd_font_installed_linux() {
+  local user_font_dir
+  user_font_dir="${XDG_DATA_HOME:-$HOME/.local/share}/fonts/NerdFonts/JetBrainsMono"
+
+  if command -v fc-list >/dev/null 2>&1; then
+    if fc-list 2>/dev/null | grep -Eiq 'JetBrainsMono(NerdFont| Nerd Font)'; then
+      return 0
+    fi
+  fi
+
+  compgen -G "${user_font_dir}/*.ttf" >/dev/null 2>&1
+}
+
+refresh_font_cache_linux() {
+  local font_dir="$1"
+
+  if ! command -v fc-cache >/dev/null 2>&1; then
+    warn "fc-cache not found; your terminal may need a restart before new fonts appear"
+    return
+  fi
+
+  fc-cache -f "$font_dir" >/dev/null 2>&1 || warn "Failed to refresh font cache for $font_dir"
+}
+
+ensure_nerd_font_linux() {
+  if nerd_font_installed_linux; then
+    return
+  fi
+
+  local apt_pkg
+  for apt_pkg in fonts-jetbrains-mono-nerd fonts-nerd-font-jetbrains-mono; do
+    if apt-cache show "$apt_pkg" >/dev/null 2>&1; then
+      log "Installing Nerd Font package from apt: $apt_pkg"
+      install_apt_missing_packages "$apt_pkg"
+      refresh_font_cache_linux "/usr/share/fonts"
+      return
+    fi
+  done
+
+  install_apt_missing_packages unzip
+
+  local user_font_dir tmp_dir archive_file
+  user_font_dir="${XDG_DATA_HOME:-$HOME/.local/share}/fonts/NerdFonts/JetBrainsMono"
+  tmp_dir="$(mktemp -d)"
+  archive_file="${tmp_dir}/JetBrainsMono.zip"
+
+  log "Installing JetBrains Mono Nerd Font to $user_font_dir"
+  mkdir -p "$user_font_dir"
+  curl -fsSL "https://github.com/ryanoasis/nerd-fonts/releases/latest/download/JetBrainsMono.zip" -o "$archive_file"
+  unzip -o "$archive_file" -d "$user_font_dir" >/dev/null
+  rm -rf "$tmp_dir"
+
+  refresh_font_cache_linux "$user_font_dir"
 }
 
 configure_gnome_terminal_font() {
@@ -283,15 +557,161 @@ install_debian_dependencies() {
   need_cmd apt-get
   need_cmd dpkg
 
-  install_apt_missing_packages git curl fzf zsh ca-certificates fonts-jetbrains-mono
+  install_apt_missing_packages git curl fzf zsh ca-certificates fonts-jetbrains-mono fontconfig ripgrep fd-find build-essential
+  ensure_neovim_linux
+  ensure_lazygit_linux
+  ensure_tree_sitter_cli_linux
+  ensure_fd_linux
   ensure_zoxide_linux
   ensure_oh_my_posh_linux
+  ensure_nerd_font_linux
   ensure_ghostty_linux
   configure_gnome_terminal_font
 }
 
 dotfiles_git() {
   /usr/bin/git --git-dir="$DOTFILES_DIR" --work-tree="$DOTFILES_WORK_TREE" "$@"
+}
+
+is_lazyvim_config() {
+  local config_dir="$1"
+  [[ -d "$config_dir" ]] || return 1
+
+  if [[ -f "$config_dir/lazyvim.json" ]]; then
+    return 0
+  fi
+
+  if [[ -f "$config_dir/lua/config/lazy.lua" ]] && grep -Eq 'LazyVim/LazyVim|lazyvim' "$config_dir/lua/config/lazy.lua"; then
+    return 0
+  fi
+
+  return 1
+}
+
+backup_path_if_exists() {
+  local path="$1"
+  local suffix="$2"
+  local backup_path
+
+  if [[ ! -e "$path" && ! -L "$path" ]]; then
+    return
+  fi
+
+  backup_path="${path}.${suffix}"
+  mv "$path" "$backup_path"
+  log "Backed up $path to $backup_path"
+}
+
+ensure_lazyvim_installed() {
+  if [[ "$LAZYVIM_INSTALL" != "1" ]]; then
+    log "Skipping LazyVim install because LAZYVIM_INSTALL=$LAZYVIM_INSTALL"
+    return
+  fi
+
+  need_cmd git
+  if ! current_nvim_version >/dev/null 2>&1; then
+    fail "Neovim is required for LazyVim but was not found"
+  fi
+
+  if ! nvim_meets_min_version; then
+    fail "LazyVim requires Neovim >= $LAZYVIM_NEOVIM_MIN_VERSION, but found $(current_nvim_version || echo "none")"
+  fi
+
+  if is_lazyvim_config "$LAZYVIM_CONFIG_DIR"; then
+    log "LazyVim is already installed at $LAZYVIM_CONFIG_DIR"
+    return
+  fi
+
+  local backup_suffix
+  backup_suffix="pre-lazyvim.$(date +%Y%m%d-%H%M%S)"
+
+  backup_path_if_exists "$LAZYVIM_CONFIG_DIR" "$backup_suffix"
+  backup_path_if_exists "$HOME/.local/share/nvim" "$backup_suffix"
+  backup_path_if_exists "$HOME/.local/state/nvim" "$backup_suffix"
+  backup_path_if_exists "$HOME/.cache/nvim" "$backup_suffix"
+
+  local tmp_dir staged_dir
+  tmp_dir="$(mktemp -d)"
+  staged_dir="${tmp_dir}/nvim"
+
+  log "Cloning LazyVim starter from $LAZYVIM_STARTER_REPO"
+  /usr/bin/git clone "$LAZYVIM_STARTER_REPO" "$staged_dir"
+  rm -rf "$staged_dir/.git"
+
+  mkdir -p "$(dirname "$LAZYVIM_CONFIG_DIR")"
+  mv "$staged_dir" "$LAZYVIM_CONFIG_DIR"
+  rm -rf "$tmp_dir"
+
+  log "LazyVim installed at $LAZYVIM_CONFIG_DIR"
+  log "Run 'nvim' and ':LazyHealth' to verify plugins and dependencies"
+}
+
+extract_checkout_conflict_paths() {
+  local checkout_output="$1"
+
+  printf '%s\n' "$checkout_output" | awk '
+    /following files would .*checkout:/ {
+      capture=1
+      next
+    }
+    capture && (/^Please / || /^Aborting/ || /^error:/ || /^fatal:/ || /^$/) {
+      capture=0
+      next
+    }
+    capture {
+      line=$0
+      sub(/^[[:space:]]+/, "", line)
+      sub(/[[:space:]]+$/, "", line)
+      if (length(line) > 0) {
+        print line
+      }
+    }
+  ' | sort -u
+}
+
+backup_checkout_conflicts() {
+  LAST_DOTFILES_BACKUP_DIR=""
+
+  local timestamp
+  timestamp="$(date +%Y%m%d-%H%M%S)"
+
+  local backup_dir
+  backup_dir="${DOTFILES_BACKUP_ROOT}/${timestamp}"
+
+  local created=0
+  local rel_path source_path target_path
+
+  while IFS= read -r rel_path; do
+    [[ -n "$rel_path" ]] || continue
+    rel_path="${rel_path#./}"
+
+    case "$rel_path" in
+      ""|/*|../*|*/../*|*/..|..)
+        warn "Skipping suspicious checkout conflict path: $rel_path"
+        continue
+        ;;
+    esac
+
+    source_path="${DOTFILES_WORK_TREE}/${rel_path}"
+    if [[ ! -e "$source_path" && ! -L "$source_path" ]]; then
+      continue
+    fi
+
+    if (( created == 0 )); then
+      mkdir -p "$backup_dir"
+      log "Backing up existing files that conflict with dotfiles checkout to $backup_dir"
+      created=1
+    fi
+
+    target_path="${backup_dir}/${rel_path}"
+    mkdir -p "$(dirname "$target_path")"
+    mv "$source_path" "$target_path"
+    log "Moved $rel_path to backup"
+  done
+
+  if (( created == 1 )); then
+    LAST_DOTFILES_BACKUP_DIR="$backup_dir"
+  fi
 }
 
 ensure_dotfiles_repo() {
@@ -332,8 +752,27 @@ ensure_dotfiles_repo() {
 
   local checkout_output
   if ! checkout_output="$(dotfiles_git checkout 2>&1)"; then
-    printf '%s\n' "$checkout_output" >&2
-    fail "Dotfiles checkout failed. Resolve conflicts in $DOTFILES_WORK_TREE and rerun."
+    local conflict_paths
+    conflict_paths="$(extract_checkout_conflict_paths "$checkout_output" || true)"
+
+    if [[ -n "$conflict_paths" ]]; then
+      backup_checkout_conflicts <<< "$conflict_paths"
+
+      if [[ -n "$LAST_DOTFILES_BACKUP_DIR" ]]; then
+        log "Retrying dotfiles checkout after moving conflicting files"
+        if ! checkout_output="$(dotfiles_git checkout 2>&1)"; then
+          printf '%s\n' "$checkout_output" >&2
+          fail "Dotfiles checkout failed after backup. Inspect $LAST_DOTFILES_BACKUP_DIR and resolve remaining conflicts."
+        fi
+        log "Conflicting files were backed up to $LAST_DOTFILES_BACKUP_DIR"
+      else
+        printf '%s\n' "$checkout_output" >&2
+        fail "Dotfiles checkout failed but no conflicting files were found to back up."
+      fi
+    else
+      printf '%s\n' "$checkout_output" >&2
+      fail "Dotfiles checkout failed. Resolve conflicts in $DOTFILES_WORK_TREE and rerun."
+    fi
   fi
 
   dotfiles_git config --local status.showUntrackedFiles no
@@ -360,6 +799,7 @@ main() {
   esac
 
   ensure_dotfiles_repo
+  ensure_lazyvim_installed
 
   log "All done"
 }
