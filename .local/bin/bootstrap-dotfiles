@@ -12,6 +12,11 @@ LAZYVIM_INSTALL="${LAZYVIM_INSTALL:-1}"
 LAZYVIM_CONFIG_DIR="${LAZYVIM_CONFIG_DIR:-$HOME/.config/nvim}"
 LAZYVIM_STARTER_REPO="${LAZYVIM_STARTER_REPO:-https://github.com/LazyVim/starter.git}"
 LAZYVIM_NEOVIM_MIN_VERSION="${LAZYVIM_NEOVIM_MIN_VERSION:-0.11.2}"
+SHELL_RC_MODE="${SHELL_RC_MODE:-managed}"
+ZSHRC_PATH="${ZSHRC_PATH:-$HOME/.zshrc}"
+BASHRC_PATH="${BASHRC_PATH:-$HOME/.bashrc}"
+ZSHRC_MANAGED_PATH="${ZSHRC_MANAGED_PATH:-$HOME/.zshrc.kalle}"
+BASHRC_MANAGED_PATH="${BASHRC_MANAGED_PATH:-$HOME/.bashrc.kalle}"
 
 APT_UPDATED=0
 LAST_DOTFILES_BACKUP_DIR=""
@@ -596,6 +601,85 @@ dotfiles_git() {
   /usr/bin/git --git-dir="$DOTFILES_DIR" --work-tree="$DOTFILES_WORK_TREE" "$@"
 }
 
+shell_quote() {
+  printf '%q' "$1"
+}
+
+path_relative_to_work_tree() {
+  local path="$1"
+
+  case "$path" in
+    "$DOTFILES_WORK_TREE")
+      printf '.\n'
+      ;;
+    "$DOTFILES_WORK_TREE"/*)
+      printf '%s\n' "${path#"$DOTFILES_WORK_TREE"/}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+dotfiles_repo_tracks_path() {
+  local rel_path="$1"
+  /usr/bin/git --git-dir="$DOTFILES_DIR" ls-files --error-unmatch -- "$rel_path" >/dev/null 2>&1
+}
+
+dotfiles_repo_tracks_abs_path() {
+  local abs_path="$1"
+  local rel_path
+
+  rel_path="$(path_relative_to_work_tree "$abs_path")" || return 1
+  [[ "$rel_path" != "." ]] || return 1
+
+  dotfiles_repo_tracks_path "$rel_path"
+}
+
+validate_shell_rc_mode() {
+  case "$SHELL_RC_MODE" in
+    managed|appended)
+      ;;
+    *)
+      fail "Unsupported SHELL_RC_MODE: $SHELL_RC_MODE (expected 'managed' or 'appended')"
+      ;;
+  esac
+}
+
+validate_shell_rc_repo_layout() {
+  local zshrc_tracked=0
+  local bashrc_tracked=0
+  local zshrc_managed_tracked=0
+  local bashrc_managed_tracked=0
+
+  if dotfiles_repo_tracks_abs_path "$ZSHRC_PATH"; then
+    zshrc_tracked=1
+  fi
+  if dotfiles_repo_tracks_abs_path "$BASHRC_PATH"; then
+    bashrc_tracked=1
+  fi
+  if dotfiles_repo_tracks_abs_path "$ZSHRC_MANAGED_PATH"; then
+    zshrc_managed_tracked=1
+  fi
+  if dotfiles_repo_tracks_abs_path "$BASHRC_MANAGED_PATH"; then
+    bashrc_managed_tracked=1
+  fi
+
+  if (( zshrc_tracked == 1 && zshrc_managed_tracked == 1 )); then
+    fail "Dotfiles repo tracks both $ZSHRC_PATH and $ZSHRC_MANAGED_PATH. Track only one shell entrypoint for zsh."
+  fi
+
+  if (( bashrc_tracked == 1 && bashrc_managed_tracked == 1 )); then
+    fail "Dotfiles repo tracks both $BASHRC_PATH and $BASHRC_MANAGED_PATH. Track only one shell entrypoint for bash."
+  fi
+
+  if [[ "$SHELL_RC_MODE" == "appended" ]]; then
+    if (( zshrc_tracked == 1 || bashrc_tracked == 1 )); then
+      fail "SHELL_RC_MODE=appended requires the repo to track managed shell files like $ZSHRC_MANAGED_PATH and $BASHRC_MANAGED_PATH instead of $ZSHRC_PATH/$BASHRC_PATH."
+    fi
+  fi
+}
+
 is_lazyvim_config() {
   local config_dir="$1"
   [[ -d "$config_dir" ]] || return 1
@@ -623,6 +707,103 @@ backup_path_if_exists() {
   backup_path="${path}.${suffix}"
   mv "$path" "$backup_path"
   log "Backed up $path to $backup_path"
+}
+
+ensure_symlink_target() {
+  local link_path="$1"
+  local source_path="$2"
+  local backup_suffix="$3"
+
+  mkdir -p "$(dirname "$link_path")"
+
+  if [[ -L "$link_path" ]] && [[ "$(readlink "$link_path")" == "$source_path" ]]; then
+    return
+  fi
+
+  if [[ -e "$link_path" || -L "$link_path" ]]; then
+    backup_path_if_exists "$link_path" "$backup_suffix"
+  fi
+
+  ln -sfn "$source_path" "$link_path"
+  log "Linked $link_path -> $source_path"
+}
+
+append_shell_rc_include() {
+  local shell_name="$1"
+  local target_path="$2"
+  local source_path="$3"
+  local start_marker end_marker include_line source_quoted
+
+  source_quoted="$(shell_quote "$source_path")"
+
+  case "$shell_name" in
+    zsh)
+      start_marker="# >>> bootstrap-dotfiles zsh include >>>"
+      end_marker="# <<< bootstrap-dotfiles zsh include <<<"
+      include_line="[[ -f $source_quoted ]] && source $source_quoted"
+      ;;
+    bash)
+      start_marker="# >>> bootstrap-dotfiles bash include >>>"
+      end_marker="# <<< bootstrap-dotfiles bash include <<<"
+      include_line="[ -f $source_quoted ] && . $source_quoted"
+      ;;
+    *)
+      fail "Unsupported shell rc target: $shell_name"
+      ;;
+  esac
+
+  mkdir -p "$(dirname "$target_path")"
+
+  if [[ -e "$target_path" && ! -f "$target_path" && ! -L "$target_path" ]]; then
+    fail "$target_path exists but is not a regular file or symlink"
+  fi
+
+  if [[ -f "$target_path" || -L "$target_path" ]]; then
+    if grep -Fq "$start_marker" "$target_path" 2>/dev/null || grep -Fq "$include_line" "$target_path" 2>/dev/null; then
+      return
+    fi
+  fi
+
+  {
+    if [[ -f "$target_path" ]] && [[ -s "$target_path" ]]; then
+      printf '\n'
+    fi
+    printf '%s\n%s\n%s\n' "$start_marker" "$include_line" "$end_marker"
+  } >> "$target_path"
+
+  log "Appended $shell_name include for $source_path to $target_path"
+}
+
+configure_shell_rc_file() {
+  local shell_name="$1"
+  local target_path="$2"
+  local managed_path="$3"
+  local backup_suffix="$4"
+
+  if [[ ! -e "$managed_path" && ! -L "$managed_path" ]]; then
+    return
+  fi
+
+  if [[ "$target_path" == "$managed_path" ]]; then
+    return
+  fi
+
+  case "$SHELL_RC_MODE" in
+    managed)
+      ensure_symlink_target "$target_path" "$managed_path" "$backup_suffix"
+      ;;
+    appended)
+      append_shell_rc_include "$shell_name" "$target_path" "$managed_path"
+      ;;
+  esac
+}
+
+configure_shell_rc_files() {
+  local backup_suffix
+  backup_suffix="pre-shell-rc.$(date +%Y%m%d-%H%M%S)"
+
+  configure_shell_rc_file zsh "$ZSHRC_PATH" "$ZSHRC_MANAGED_PATH" "$backup_suffix"
+  configure_shell_rc_file bash "$BASHRC_PATH" "$BASHRC_MANAGED_PATH" "$backup_suffix"
 }
 
 ensure_lazyvim_installed() {
@@ -773,6 +954,8 @@ ensure_dotfiles_repo() {
     warn "No origin remote found for $DOTFILES_DIR; skipping fetch"
   fi
 
+  validate_shell_rc_repo_layout
+
   local checkout_output
   if ! checkout_output="$(dotfiles_git checkout 2>&1)"; then
     local conflict_paths
@@ -804,6 +987,7 @@ ensure_dotfiles_repo() {
 
 main() {
   ensure_local_bin
+  validate_shell_rc_mode
 
   case "$(uname -s)" in
     Darwin)
@@ -822,6 +1006,7 @@ main() {
   esac
 
   ensure_dotfiles_repo
+  configure_shell_rc_files
   ensure_lazyvim_installed
 
   log "All done"

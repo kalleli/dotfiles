@@ -1,0 +1,4 @@
+eval "$(direnv hook bash)"
+eval "$(oh-my-posh init bash --config $HOME/.config/ohmyposh/config.toml)"
+
+
