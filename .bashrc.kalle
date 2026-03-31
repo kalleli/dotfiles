@@ -1,4 +1,5 @@
-eval "$(direnv hook bash)"
+if command -v direnv >/dev/null 2>&1; then
+  eval "$(direnv hook bash)"
+fi
 eval "$(oh-my-posh init bash --config $HOME/.config/ohmyposh/config.toml)"
-
 
