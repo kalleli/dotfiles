@@ -266,6 +266,7 @@ install_macos_dependencies() {
   ensure_brew_cask font-jetbrains-mono
   ensure_brew_cask font-jetbrains-mono-nerd-font
   ensure_brew_cask ghostty
+  ensure_brew_cask cmux
 
   if ! nvim_meets_min_version; then
     fail "LazyVim requires Neovim >= $LAZYVIM_NEOVIM_MIN_VERSION, but found $(current_nvim_version || echo "none")"
