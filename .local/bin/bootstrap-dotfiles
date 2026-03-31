@@ -445,6 +445,24 @@ ensure_fd_linux() {
   log "Linked fd to fdfind at $fd_target"
 }
 
+install_ghostty_linux_release() {
+  local tmp_file
+  tmp_file="$(mktemp)"
+
+  log "Installing Ghostty via the Debian/Ubuntu package installer"
+  if ! curl -fsSL "https://raw.githubusercontent.com/mkasberg/ghostty-ubuntu/HEAD/install.sh" -o "$tmp_file"; then
+    rm -f "$tmp_file"
+    return 1
+  fi
+
+  if ! bash "$tmp_file"; then
+    rm -f "$tmp_file"
+    return 1
+  fi
+
+  rm -f "$tmp_file"
+}
+
 ensure_ghostty_linux() {
   if command -v ghostty >/dev/null 2>&1; then
     return
@@ -455,7 +473,11 @@ ensure_ghostty_linux() {
     return
   fi
 
-  warn "ghostty package not found in apt repositories; skipping ghostty install on Debian/Ubuntu"
+  if install_ghostty_linux_release && command -v ghostty >/dev/null 2>&1; then
+    return
+  fi
+
+  warn "Could not install Ghostty automatically on Debian/Ubuntu; continuing without Ghostty"
 }
 
 nerd_font_installed_linux() {

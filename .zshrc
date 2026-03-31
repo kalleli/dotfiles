@@ -7,7 +7,9 @@ export KUBECONFIG="$HOME/.kube/k8s-dev.yaml"
 # bun
 export BUN_INSTALL="$HOME/.bun"
 export PATH="$BUN_INSTALL/bin:$PATH"
-eval "$(direnv hook zsh)"
+if command -v direnv >/dev/null 2>&1; then
+  eval "$(direnv hook zsh)"
+fi
 export PATH="$HOME/.local/bin:$PATH"
 export TALOSCONFIG="$HOME/.talos/k8s-dev.yaml"
 
