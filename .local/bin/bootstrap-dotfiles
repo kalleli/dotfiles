@@ -12,6 +12,7 @@ LAZYVIM_INSTALL="${LAZYVIM_INSTALL:-1}"
 LAZYVIM_CONFIG_DIR="${LAZYVIM_CONFIG_DIR:-$HOME/.config/nvim}"
 LAZYVIM_STARTER_REPO="${LAZYVIM_STARTER_REPO:-https://github.com/LazyVim/starter.git}"
 LAZYVIM_NEOVIM_MIN_VERSION="${LAZYVIM_NEOVIM_MIN_VERSION:-0.11.2}"
+TREE_SITTER_CLI_MIN_VERSION="${TREE_SITTER_CLI_MIN_VERSION:-0.26.1}"
 SHELL_RC_MODE="${SHELL_RC_MODE:-managed}"
 ZSHRC_PATH="${ZSHRC_PATH:-$HOME/.zshrc}"
 BASHRC_PATH="${BASHRC_PATH:-$HOME/.bashrc}"
@@ -87,6 +88,21 @@ current_nvim_version() {
   fi
 
   "$nvim_bin" --version 2>/dev/null | awk 'NR == 1 { print $2; exit }' | sed 's/^v//'
+}
+
+current_tree_sitter_cli_version() {
+  if ! command -v tree-sitter >/dev/null 2>&1; then
+    return 1
+  fi
+
+  tree-sitter --version 2>/dev/null | awk 'NR == 1 { print $2; exit }' | sed 's/^v//'
+}
+
+tree_sitter_cli_meets_min_version() {
+  local current_version
+  current_version="$(current_tree_sitter_cli_version || true)"
+  [[ -n "$current_version" ]] || return 1
+  version_ge "$current_version" "$TREE_SITTER_CLI_MIN_VERSION"
 }
 
 nvim_meets_min_version() {
@@ -397,18 +413,24 @@ ensure_lazygit_linux() {
 }
 
 ensure_tree_sitter_cli_linux() {
-  if command -v tree-sitter >/dev/null 2>&1; then
+  if tree_sitter_cli_meets_min_version; then
     return
+  fi
+
+  if command -v tree-sitter >/dev/null 2>&1; then
+    warn "tree-sitter $(current_tree_sitter_cli_version || echo unknown) is too old; LazyVim requires tree-sitter-cli >= $TREE_SITTER_CLI_MIN_VERSION"
   fi
 
   if apt-cache show tree-sitter-cli >/dev/null 2>&1; then
     install_apt_missing_packages tree-sitter-cli
-    return
+    if tree_sitter_cli_meets_min_version; then
+      return
+    fi
   fi
 
   if apt-cache show tree-sitter >/dev/null 2>&1; then
     install_apt_missing_packages tree-sitter
-    if command -v tree-sitter >/dev/null 2>&1; then
+    if tree_sitter_cli_meets_min_version; then
       return
     fi
   fi
@@ -420,14 +442,17 @@ ensure_tree_sitter_cli_linux() {
   fi
 
   if command -v npm >/dev/null 2>&1; then
-    log "Installing tree-sitter-cli via npm into $HOME/.local"
+    log "Installing tree-sitter-cli >= $TREE_SITTER_CLI_MIN_VERSION via npm into $HOME/.local"
     if npm install -g --prefix "$HOME/.local" tree-sitter-cli >/dev/null; then
-      return
+      if "$HOME/.local/bin/tree-sitter" --version >/dev/null 2>&1; then
+        log "Installed tree-sitter-cli to $HOME/.local/bin/tree-sitter"
+        return
+      fi
     fi
     warn "npm install for tree-sitter-cli failed"
   fi
 
-  warn "Could not install tree-sitter-cli automatically; install it manually for full LazyVim treesitter support"
+  warn "Could not install tree-sitter-cli >= $TREE_SITTER_CLI_MIN_VERSION automatically; install it manually for full LazyVim treesitter support"
 }
 
 ensure_fd_linux() {
@@ -595,6 +620,30 @@ install_debian_dependencies() {
   ensure_nerd_font_linux
   ensure_ghostty_linux
   configure_gnome_terminal_font
+}
+
+ensure_default_shell_zsh() {
+  local zsh_path current_shell
+
+  zsh_path="$(command -v zsh || true)"
+  [[ -n "$zsh_path" ]] || return
+
+  current_shell="$(getent passwd "$USER" | cut -d: -f7)"
+  if [[ "$current_shell" == "$zsh_path" ]]; then
+    return
+  fi
+
+  if ! grep -Fxq "$zsh_path" /etc/shells 2>/dev/null; then
+    warn "$zsh_path is not listed in /etc/shells; skipping default shell change"
+    return
+  fi
+
+  log "Changing default shell to $zsh_path"
+  if chsh -s "$zsh_path" "$USER"; then
+    log "Default shell updated to $zsh_path"
+  else
+    warn "Could not change default shell automatically; run: chsh -s $zsh_path"
+  fi
 }
 
 dotfiles_git() {
@@ -1007,6 +1056,7 @@ main() {
 
   ensure_dotfiles_repo
   configure_shell_rc_files
+  ensure_default_shell_zsh
   ensure_lazyvim_installed
 
   log "All done"
