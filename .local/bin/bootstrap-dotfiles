@@ -12,6 +12,7 @@ LAZYVIM_INSTALL="${LAZYVIM_INSTALL:-1}"
 LAZYVIM_CONFIG_DIR="${LAZYVIM_CONFIG_DIR:-$HOME/.config/nvim}"
 LAZYVIM_STARTER_REPO="${LAZYVIM_STARTER_REPO:-https://github.com/LazyVim/starter.git}"
 LAZYVIM_NEOVIM_MIN_VERSION="${LAZYVIM_NEOVIM_MIN_VERSION:-0.11.2}"
+TREE_SITTER_CLI_MIN_VERSION="${TREE_SITTER_CLI_MIN_VERSION:-0.26.1}"
 SHELL_RC_MODE="${SHELL_RC_MODE:-managed}"
 ZSHRC_PATH="${ZSHRC_PATH:-$HOME/.zshrc}"
 BASHRC_PATH="${BASHRC_PATH:-$HOME/.bashrc}"
@@ -89,6 +90,21 @@ current_nvim_version() {
   "$nvim_bin" --version 2>/dev/null | awk 'NR == 1 { print $2; exit }' | sed 's/^v//'
 }
 
+current_tree_sitter_cli_version() {
+  if ! command -v tree-sitter >/dev/null 2>&1; then
+    return 1
+  fi
+
+  tree-sitter --version 2>/dev/null | awk 'NR == 1 { print $2; exit }' | sed 's/^v//'
+}
+
+tree_sitter_cli_meets_min_version() {
+  local current_version
+  current_version="$(current_tree_sitter_cli_version || true)"
+  [[ -n "$current_version" ]] || return 1
+  version_ge "$current_version" "$TREE_SITTER_CLI_MIN_VERSION"
+}
+
 nvim_meets_min_version() {
   local current_version
   current_version="$(current_nvim_version || true)"
@@ -119,12 +135,12 @@ install_apt_missing_packages() {
     fi
   done
 
-  if (( ${#missing[@]} == 0 )); then
+  if ((${#missing[@]} == 0)); then
     log "APT dependencies already installed"
     return
   fi
 
-  if (( APT_UPDATED == 0 )); then
+  if ((APT_UPDATED == 0)); then
     log "Updating apt package index"
     sudo_if_needed apt-get update
     APT_UPDATED=1
@@ -141,6 +157,29 @@ is_debian_like() {
   . /etc/os-release
 
   [[ "${ID:-}" == "debian" || "${ID:-}" == "ubuntu" || "${ID_LIKE:-}" == *"debian"* ]]
+}
+
+os_release_field() {
+  local field="$1"
+  [[ -f /etc/os-release ]] || return 1
+
+  awk -F= -v key="$field" '
+    $1 == key {
+      value = substr($0, index($0, "=") + 1)
+      gsub(/^"/, "", value)
+      gsub(/"$/, "", value)
+      print value
+      exit
+    }
+  ' /etc/os-release
+}
+
+os_id() {
+  os_release_field ID
+}
+
+os_version_id() {
+  os_release_field VERSION_ID
 }
 
 refresh_brew_path() {
@@ -212,14 +251,14 @@ configure_macos_terminal_font() {
   local term_program="${TERM_PROGRAM:-}"
 
   case "$term_program" in
-    Apple_Terminal)
-      if ! command -v osascript >/dev/null 2>&1; then
-        warn "osascript not found; skipping Terminal.app font configuration"
-        return
-      fi
+  Apple_Terminal)
+    if ! command -v osascript >/dev/null 2>&1; then
+      warn "osascript not found; skipping Terminal.app font configuration"
+      return
+    fi
 
-      log "Configuring Terminal.app font"
-      osascript <<APPLESCRIPT >/dev/null
+    log "Configuring Terminal.app font"
+    osascript <<APPLESCRIPT >/dev/null
  tell application "Terminal"
    set font name of default settings to "${MACOS_TERMINAL_FONT_NAME}"
    set font size of default settings to ${FONT_SIZE}
@@ -227,20 +266,20 @@ configure_macos_terminal_font() {
    set font size of startup settings to ${FONT_SIZE}
  end tell
 APPLESCRIPT
-      ;;
-    iTerm.app)
-      local target_font="JetBrainsMono-Regular ${FONT_SIZE}"
-      local current_font
-      current_font="$(defaults read com.googlecode.iterm2 'Normal Font' 2>/dev/null || true)"
+    ;;
+  iTerm.app)
+    local target_font="JetBrainsMono-Regular ${FONT_SIZE}"
+    local current_font
+    current_font="$(defaults read com.googlecode.iterm2 'Normal Font' 2>/dev/null || true)"
 
-      if [[ "$current_font" != "$target_font" ]]; then
-        log "Configuring iTerm2 font"
-        defaults write com.googlecode.iterm2 'Normal Font' -string "$target_font"
-      fi
-      ;;
-    *)
-      warn "TERM_PROGRAM is not Terminal.app or iTerm2; skipping terminal font setup on macOS"
-      ;;
+    if [[ "$current_font" != "$target_font" ]]; then
+      log "Configuring iTerm2 font"
+      defaults write com.googlecode.iterm2 'Normal Font' -string "$target_font"
+    fi
+    ;;
+  *)
+    warn "TERM_PROGRAM is not Terminal.app or iTerm2; skipping terminal font setup on macOS"
+    ;;
   esac
 }
 
@@ -283,15 +322,15 @@ install_macos_dependencies() {
 
 linux_arch() {
   case "$(uname -m)" in
-    x86_64|amd64)
-      printf 'amd64\n'
-      ;;
-    arm64|aarch64)
-      printf 'arm64\n'
-      ;;
-    *)
-      return 1
-      ;;
+  x86_64 | amd64)
+    printf 'amd64\n'
+    ;;
+  arm64 | aarch64)
+    printf 'arm64\n'
+    ;;
+  *)
+    return 1
+    ;;
   esac
 }
 
@@ -328,15 +367,15 @@ ensure_zoxide_linux() {
 
 neovim_linux_arch() {
   case "$(uname -m)" in
-    x86_64|amd64)
-      printf 'x86_64\n'
-      ;;
-    arm64|aarch64)
-      printf 'arm64\n'
-      ;;
-    *)
-      return 1
-      ;;
+  x86_64 | amd64)
+    printf 'x86_64\n'
+    ;;
+  arm64 | aarch64)
+    printf 'arm64\n'
+    ;;
+  *)
+    return 1
+    ;;
   esac
 }
 
@@ -388,27 +427,73 @@ ensure_lazygit_linux() {
     return
   fi
 
-  if apt-cache show lazygit >/dev/null 2>&1; then
-    install_apt_missing_packages lazygit
-    return
+  local distro version_id
+  distro="$(os_id || true)"
+  version_id="$(os_version_id || true)"
+
+  if [[ "$distro" == "ubuntu" ]] && [[ -n "$version_id" ]] && version_ge "$version_id" "25.10"; then
+    if apt-cache show lazygit >/dev/null 2>&1; then
+      log "Installing lazygit from apt for Ubuntu $version_id"
+      install_apt_missing_packages lazygit
+      return
+    fi
+    warn "Ubuntu $version_id should provide lazygit via apt, but no apt package was found"
   fi
 
-  warn "lazygit package not found in apt repositories; skipping optional lazygit dependency"
+  if [[ "$distro" == "debian" ]] && [[ -n "$version_id" ]] && version_ge "$version_id" "13"; then
+    if apt-cache show lazygit >/dev/null 2>&1; then
+      log "Installing lazygit from apt for Debian $version_id"
+      install_apt_missing_packages lazygit
+      return
+    fi
+    warn "Debian $version_id should provide lazygit via apt, but no apt package was found"
+  fi
+
+  local lazygit_version lazygit_arch tmp_dir archive_file
+  lazygit_version="$(curl -fsSL "https://api.github.com/repos/jesseduffield/lazygit/releases/latest" | grep -Po '"tag_name": *"v\K[^"]*')"
+  [[ -n "$lazygit_version" ]] || fail "Could not determine latest lazygit release version"
+
+  case "$(uname -m)" in
+    x86_64|amd64)
+      lazygit_arch="x86_64"
+      ;;
+    aarch64|arm64)
+      lazygit_arch="arm64"
+      ;;
+    *)
+      fail "Unsupported CPU architecture for lazygit release install: $(uname -m)"
+      ;;
+  esac
+
+  tmp_dir="$(mktemp -d)"
+  archive_file="${tmp_dir}/lazygit.tar.gz"
+
+  log "Installing lazygit ${lazygit_version} from upstream release"
+  curl -fsSL "https://github.com/jesseduffield/lazygit/releases/download/v${lazygit_version}/lazygit_${lazygit_version}_Linux_${lazygit_arch}.tar.gz" -o "$archive_file"
+  tar -xzf "$archive_file" -C "$tmp_dir" lazygit
+  sudo_if_needed install -m 0755 "${tmp_dir}/lazygit" /usr/local/bin/lazygit
+  rm -rf "$tmp_dir"
 }
 
 ensure_tree_sitter_cli_linux() {
-  if command -v tree-sitter >/dev/null 2>&1; then
+  if tree_sitter_cli_meets_min_version; then
     return
+  fi
+
+  if command -v tree-sitter >/dev/null 2>&1; then
+    warn "tree-sitter $(current_tree_sitter_cli_version || echo unknown) is too old; LazyVim requires tree-sitter-cli >= $TREE_SITTER_CLI_MIN_VERSION"
   fi
 
   if apt-cache show tree-sitter-cli >/dev/null 2>&1; then
     install_apt_missing_packages tree-sitter-cli
-    return
+    if tree_sitter_cli_meets_min_version; then
+      return
+    fi
   fi
 
   if apt-cache show tree-sitter >/dev/null 2>&1; then
     install_apt_missing_packages tree-sitter
-    if command -v tree-sitter >/dev/null 2>&1; then
+    if tree_sitter_cli_meets_min_version; then
       return
     fi
   fi
@@ -420,14 +505,17 @@ ensure_tree_sitter_cli_linux() {
   fi
 
   if command -v npm >/dev/null 2>&1; then
-    log "Installing tree-sitter-cli via npm into $HOME/.local"
+    log "Installing tree-sitter-cli >= $TREE_SITTER_CLI_MIN_VERSION via npm into $HOME/.local"
     if npm install -g --prefix "$HOME/.local" tree-sitter-cli >/dev/null; then
-      return
+      if "$HOME/.local/bin/tree-sitter" --version >/dev/null 2>&1; then
+        log "Installed tree-sitter-cli to $HOME/.local/bin/tree-sitter"
+        return
+      fi
     fi
     warn "npm install for tree-sitter-cli failed"
   fi
 
-  warn "Could not install tree-sitter-cli automatically; install it manually for full LazyVim treesitter support"
+  warn "Could not install tree-sitter-cli >= $TREE_SITTER_CLI_MIN_VERSION automatically; install it manually for full LazyVim treesitter support"
 }
 
 ensure_fd_linux() {
@@ -597,6 +685,30 @@ install_debian_dependencies() {
   configure_gnome_terminal_font
 }
 
+ensure_default_shell_zsh() {
+  local zsh_path current_shell
+
+  zsh_path="$(command -v zsh || true)"
+  [[ -n "$zsh_path" ]] || return
+
+  current_shell="$(getent passwd "$USER" | cut -d: -f7)"
+  if [[ "$current_shell" == "$zsh_path" ]]; then
+    return
+  fi
+
+  if ! grep -Fxq "$zsh_path" /etc/shells 2>/dev/null; then
+    warn "$zsh_path is not listed in /etc/shells; skipping default shell change"
+    return
+  fi
+
+  log "Changing default shell to $zsh_path"
+  if chsh -s "$zsh_path" "$USER"; then
+    log "Default shell updated to $zsh_path"
+  else
+    warn "Could not change default shell automatically; run: chsh -s $zsh_path"
+  fi
+}
+
 dotfiles_git() {
   /usr/bin/git --git-dir="$DOTFILES_DIR" --work-tree="$DOTFILES_WORK_TREE" "$@"
 }
@@ -609,15 +721,15 @@ path_relative_to_work_tree() {
   local path="$1"
 
   case "$path" in
-    "$DOTFILES_WORK_TREE")
-      printf '.\n'
-      ;;
-    "$DOTFILES_WORK_TREE"/*)
-      printf '%s\n' "${path#"$DOTFILES_WORK_TREE"/}"
-      ;;
-    *)
-      return 1
-      ;;
+  "$DOTFILES_WORK_TREE")
+    printf '.\n'
+    ;;
+  "$DOTFILES_WORK_TREE"/*)
+    printf '%s\n' "${path#"$DOTFILES_WORK_TREE"/}"
+    ;;
+  *)
+    return 1
+    ;;
   esac
 }
 
@@ -638,11 +750,10 @@ dotfiles_repo_tracks_abs_path() {
 
 validate_shell_rc_mode() {
   case "$SHELL_RC_MODE" in
-    managed|appended)
-      ;;
-    *)
-      fail "Unsupported SHELL_RC_MODE: $SHELL_RC_MODE (expected 'managed' or 'appended')"
-      ;;
+  managed | appended) ;;
+  *)
+    fail "Unsupported SHELL_RC_MODE: $SHELL_RC_MODE (expected 'managed' or 'appended')"
+    ;;
   esac
 }
 
@@ -665,16 +776,16 @@ validate_shell_rc_repo_layout() {
     bashrc_managed_tracked=1
   fi
 
-  if (( zshrc_tracked == 1 && zshrc_managed_tracked == 1 )); then
+  if ((zshrc_tracked == 1 && zshrc_managed_tracked == 1)); then
     fail "Dotfiles repo tracks both $ZSHRC_PATH and $ZSHRC_MANAGED_PATH. Track only one shell entrypoint for zsh."
   fi
 
-  if (( bashrc_tracked == 1 && bashrc_managed_tracked == 1 )); then
+  if ((bashrc_tracked == 1 && bashrc_managed_tracked == 1)); then
     fail "Dotfiles repo tracks both $BASHRC_PATH and $BASHRC_MANAGED_PATH. Track only one shell entrypoint for bash."
   fi
 
   if [[ "$SHELL_RC_MODE" == "appended" ]]; then
-    if (( zshrc_tracked == 1 || bashrc_tracked == 1 )); then
+    if ((zshrc_tracked == 1 || bashrc_tracked == 1)); then
       fail "SHELL_RC_MODE=appended requires the repo to track managed shell files like $ZSHRC_MANAGED_PATH and $BASHRC_MANAGED_PATH instead of $ZSHRC_PATH/$BASHRC_PATH."
     fi
   fi
@@ -737,19 +848,19 @@ append_shell_rc_include() {
   source_quoted="$(shell_quote "$source_path")"
 
   case "$shell_name" in
-    zsh)
-      start_marker="# >>> bootstrap-dotfiles zsh include >>>"
-      end_marker="# <<< bootstrap-dotfiles zsh include <<<"
-      include_line="[[ -f $source_quoted ]] && source $source_quoted"
-      ;;
-    bash)
-      start_marker="# >>> bootstrap-dotfiles bash include >>>"
-      end_marker="# <<< bootstrap-dotfiles bash include <<<"
-      include_line="[ -f $source_quoted ] && . $source_quoted"
-      ;;
-    *)
-      fail "Unsupported shell rc target: $shell_name"
-      ;;
+  zsh)
+    start_marker="# >>> bootstrap-dotfiles zsh include >>>"
+    end_marker="# <<< bootstrap-dotfiles zsh include <<<"
+    include_line="[[ -f $source_quoted ]] && source $source_quoted"
+    ;;
+  bash)
+    start_marker="# >>> bootstrap-dotfiles bash include >>>"
+    end_marker="# <<< bootstrap-dotfiles bash include <<<"
+    include_line="[ -f $source_quoted ] && . $source_quoted"
+    ;;
+  *)
+    fail "Unsupported shell rc target: $shell_name"
+    ;;
   esac
 
   mkdir -p "$(dirname "$target_path")"
@@ -769,7 +880,7 @@ append_shell_rc_include() {
       printf '\n'
     fi
     printf '%s\n%s\n%s\n' "$start_marker" "$include_line" "$end_marker"
-  } >> "$target_path"
+  } >>"$target_path"
 
   log "Appended $shell_name include for $source_path to $target_path"
 }
@@ -789,12 +900,12 @@ configure_shell_rc_file() {
   fi
 
   case "$SHELL_RC_MODE" in
-    managed)
-      ensure_symlink_target "$target_path" "$managed_path" "$backup_suffix"
-      ;;
-    appended)
-      append_shell_rc_include "$shell_name" "$target_path" "$managed_path"
-      ;;
+  managed)
+    ensure_symlink_target "$target_path" "$managed_path" "$backup_suffix"
+    ;;
+  appended)
+    append_shell_rc_include "$shell_name" "$target_path" "$managed_path"
+    ;;
   esac
 }
 
@@ -890,10 +1001,10 @@ backup_checkout_conflicts() {
     rel_path="${rel_path#./}"
 
     case "$rel_path" in
-      ""|/*|../*|*/../*|*/..|..)
-        warn "Skipping suspicious checkout conflict path: $rel_path"
-        continue
-        ;;
+    "" | /* | ../* | */../* | */.. | ..)
+      warn "Skipping suspicious checkout conflict path: $rel_path"
+      continue
+      ;;
     esac
 
     source_path="${DOTFILES_WORK_TREE}/${rel_path}"
@@ -901,7 +1012,7 @@ backup_checkout_conflicts() {
       continue
     fi
 
-    if (( created == 0 )); then
+    if ((created == 0)); then
       mkdir -p "$backup_dir"
       log "Backing up existing files that conflict with dotfiles checkout to $backup_dir"
       created=1
@@ -913,7 +1024,7 @@ backup_checkout_conflicts() {
     log "Moved $rel_path to backup"
   done
 
-  if (( created == 1 )); then
+  if ((created == 1)); then
     LAST_DOTFILES_BACKUP_DIR="$backup_dir"
   fi
 }
@@ -962,7 +1073,7 @@ ensure_dotfiles_repo() {
     conflict_paths="$(extract_checkout_conflict_paths "$checkout_output" || true)"
 
     if [[ -n "$conflict_paths" ]]; then
-      backup_checkout_conflicts <<< "$conflict_paths"
+      backup_checkout_conflicts <<<"$conflict_paths"
 
       if [[ -n "$LAST_DOTFILES_BACKUP_DIR" ]]; then
         log "Retrying dotfiles checkout after moving conflicting files"
@@ -990,23 +1101,24 @@ main() {
   validate_shell_rc_mode
 
   case "$(uname -s)" in
-    Darwin)
-      install_macos_dependencies
-      ;;
-    Linux)
-      if is_debian_like; then
-        install_debian_dependencies
-      else
-        fail "Unsupported Linux distro. This script supports Debian/Ubuntu."
-      fi
-      ;;
-    *)
-      fail "Unsupported OS: $(uname -s). This script supports macOS and Debian/Ubuntu."
-      ;;
+  Darwin)
+    install_macos_dependencies
+    ;;
+  Linux)
+    if is_debian_like; then
+      install_debian_dependencies
+    else
+      fail "Unsupported Linux distro. This script supports Debian/Ubuntu."
+    fi
+    ;;
+  *)
+    fail "Unsupported OS: $(uname -s). This script supports macOS and Debian/Ubuntu."
+    ;;
   esac
 
   ensure_dotfiles_repo
   configure_shell_rc_files
+  ensure_default_shell_zsh
   ensure_lazyvim_installed
 
   log "All done"
