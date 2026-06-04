@@ -74,5 +74,16 @@ zstyle ':fzf-tab:complete:cd:*' fzf-preview 'ls --color $realpath'
 zstyle ':fzf-tab:complete:__zoxide_z:*' fzf-preview 'ls --color $realpath'
 
 # Shell integrations
-eval "$(fzf --zsh)"
+if fzf --zsh >/dev/null 2>&1; then
+  # fzf >= 0.48.0 ships combined integration
+  eval "$(fzf --zsh)"
+else
+  # older fzf (e.g. Debian 0.44.x) ships separate files
+  for _fzf_f in \
+    /usr/share/doc/fzf/examples/completion.zsh \
+    /usr/share/doc/fzf/examples/key-bindings.zsh; do
+    [ -f "$_fzf_f" ] && source "$_fzf_f"
+  done
+  unset _fzf_f
+fi
 eval "$(zoxide init --cmd cd zsh)"
