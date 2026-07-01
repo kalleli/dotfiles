@@ -16,6 +16,42 @@ export TALOSCONFIG="$HOME/.talos/k8s-dev.yaml"
 #dotfiles
 alias dotfiles='git --git-dir=$HOME/.dotfiles/ --work-tree=$HOME'
 
+# btw (branch/tmux/worktree helper) — deployment config lives in the machine-local
+# ~/.zshrc, e.g.:
+#   export BTW_DEFAULT_REPO="$HOME/code/main-project"   # repo used outside any git project
+#   export BTW_HARNESS="claude"                          # bottom-pane AI harness
+#   export BTW_EDITOR="nvim ."                           # top-pane editor
+_btw() {
+  local -a subcmds
+  subcmds=(list remove)
+
+  # slugs = branches of linked worktrees in the resolved repo
+  _btw_slugs() {
+    local start="$PWD" repo common
+    if ! git -C "$start" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      start="${BTW_DEFAULT_REPO:-}"
+    fi
+    [[ -n "$start" ]] || return 0
+    common="$(git -C "$start" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 0
+    repo="${common:h}"
+    local -a slugs
+    slugs=("${(@f)$(git -C "$repo" worktree list --porcelain 2>/dev/null \
+      | awk -v main="$repo" '
+          /^worktree /{wt=substr($0,10)}
+          /^branch /{b=substr($0,8); sub(/^refs\/heads\//,"",b); if (wt!=main) print b}')}")
+    _describe -t slugs 'work slug' slugs
+  }
+
+  if (( CURRENT == 2 )); then
+    # First word: existing slugs (to re-enter) plus the subcommands.
+    _btw_slugs
+    _describe -t commands 'btw command' subcmds
+  elif (( CURRENT == 3 )) && [[ "$words[2]" == remove ]]; then
+    _btw_slugs
+  fi
+}
+compdef _btw btw
+
 if [ "$TERM_PROGRAM" != "Apple_Terminal" ]; then
   eval "$(oh-my-posh init zsh --config $HOME/.config/ohmyposh/config.toml)"
 fi
