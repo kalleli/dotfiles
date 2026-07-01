@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+# btw - branch/tmux/worktree helper
+#
+# Usage:
+#   btw <work_slug>          Create a git worktree + tmux session and drop into a dev layout
+#   btw list                 List active btw worktrees (and whether a tmux session exists)
+#   btw remove [-f] [<slug>] Tear down the tmux session, worktree folder, and branch
+#                            (slug defaults to the worktree you're currently in)
+#
+# Deployment config (set these in your machine-local ~/.zshrc, not in the tracked
+# ~/.zshrc.kalle):
+#   BTW_DEFAULT_REPO   Git repo to use when you run btw outside of any git project.
+#   BTW_HARNESS        AI harness command for the bottom pane.  Default: claude
+#   BTW_EDITOR         Editor command for the top pane.          Default: nvim .
+set -euo pipefail
+
+BTW_HARNESS="${BTW_HARNESS:-claude}"
+BTW_EDITOR="${BTW_EDITOR:-nvim .}"
+
+die() {
+  printf 'btw: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  btw <work_slug>          Create a git worktree + tmux session with a dev layout
+  btw list                 List active btw worktrees
+  btw remove [-f] [<slug>] Remove the tmux session, worktree folder, and branch
+                           (defaults to the worktree you're currently in)
+EOF
+  exit 2
+}
+
+# Resolve the git repo to operate on: the current project if we're inside one,
+# otherwise $BTW_DEFAULT_REPO.  Prints the repo's main worktree path.
+resolve_main_worktree() {
+  local start="$PWD"
+  if git -C "$start" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    :
+  elif [ -n "${BTW_DEFAULT_REPO:-}" ]; then
+    [ -d "$BTW_DEFAULT_REPO" ] || die "BTW_DEFAULT_REPO is set but not a directory: $BTW_DEFAULT_REPO"
+    git -C "$BTW_DEFAULT_REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+      || die "BTW_DEFAULT_REPO is not a git repo: $BTW_DEFAULT_REPO"
+    start="$BTW_DEFAULT_REPO"
+  else
+    die "not inside a git project and BTW_DEFAULT_REPO is not set"
+  fi
+
+  # git-common-dir points at the shared .git dir; its parent is the main worktree,
+  # even when we're currently sitting inside a linked worktree.
+  local common_dir
+  common_dir="$(git -C "$start" rev-parse --path-format=absolute --git-common-dir)"
+  dirname "$common_dir"
+}
+
+# Path a worktree for <slug> would live at: sibling of the main project folder.
+worktree_path_for() {
+  local main="$1" slug="$2"
+  printf '%s/%s.%s' "$(dirname "$main")" "$(basename "$main")" "$slug"
+}
+
+session_exists() {
+  tmux has-session -t "=$1" 2>/dev/null
+}
+
+cmd_create() {
+  local slug="$1"
+  command -v tmux >/dev/null 2>&1 || die "tmux is not installed"
+
+  local main wt
+  main="$(resolve_main_worktree)"
+  wt="$(worktree_path_for "$main" "$slug")"
+
+  # Create the worktree + branch if it isn't there yet.
+  if [ -d "$wt" ]; then
+    printf 'btw: reusing existing worktree %s\n' "$wt" >&2
+  elif git -C "$main" show-ref --verify --quiet "refs/heads/$slug"; then
+    git -C "$main" worktree add "$wt" "$slug"
+  else
+    git -C "$main" worktree add "$wt" -b "$slug"
+  fi
+
+  # Create the tmux session with the dev layout if it isn't there yet.
+  if ! session_exists "$slug"; then
+    tmux new-session -d -s "$slug" -c "$wt" -n dev
+    local top bottom
+    top="$(tmux display-message -p -t "=$slug:dev" '#{pane_id}')"
+    tmux send-keys -t "$top" "$BTW_EDITOR" C-m
+    bottom="$(tmux split-window -v -P -F '#{pane_id}' -t "$top" -c "$wt")"
+    tmux send-keys -t "$bottom" "$BTW_HARNESS" C-m
+    tmux select-pane -t "$top"
+  fi
+
+  # Drop the user into the session.
+  if [ -n "${TMUX:-}" ]; then
+    tmux switch-client -t "=$slug"
+  else
+    tmux attach-session -t "=$slug"
+  fi
+}
+
+cmd_list() {
+  local main
+  main="$(resolve_main_worktree)"
+
+  local found=0 line wt branch slug marker
+  # Parse porcelain output; skip the main worktree, report the rest.
+  while IFS= read -r line; do
+    case "$line" in
+      worktree\ *) wt="${line#worktree }" ;;
+      branch\ *)
+        branch="${line#branch }"
+        branch="${branch#refs/heads/}"
+        [ "$wt" = "$main" ] && continue
+        slug="$branch"
+        if session_exists "$slug"; then marker="tmux"; else marker="----"; fi
+        printf '%-4s  %-24s  %s\n' "$marker" "$slug" "$wt"
+        found=1
+        ;;
+    esac
+  done < <(git -C "$main" worktree list --porcelain)
+
+  [ "$found" -eq 1 ] || printf 'btw: no worktrees\n' >&2
+}
+
+cmd_remove() {
+  local force=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -f|--force) force=1; shift ;;
+      -*) die "unknown flag: $1" ;;
+      *) break ;;
+    esac
+  done
+  [ "$#" -le 1 ] || usage
+
+  local main wt slug
+  main="$(resolve_main_worktree)"
+
+  if [ "$#" -eq 1 ]; then
+    slug="$1"
+    wt="$(worktree_path_for "$main" "$slug")"
+  else
+    # No slug given: infer it from the worktree we're standing in.
+    local cur
+    cur="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)" \
+      || die "no slug given and not inside a git worktree"
+    [ "$cur" != "$main" ] \
+      || die "no slug given and this is the main checkout, not a btw worktree"
+    slug="$(git -C "$cur" rev-parse --abbrev-ref HEAD)"
+    wt="$cur"
+  fi
+
+  # Remove the worktree.  (git runs with -C "$main", so removing the directory we
+  # happen to be standing in is fine.)
+  if [ -d "$wt" ]; then
+    if [ "$force" -eq 1 ]; then
+      git -C "$main" worktree remove --force "$wt"
+    else
+      git -C "$main" worktree remove "$wt" \
+        || die "worktree has changes; re-run with -f to force: btw remove -f $slug"
+    fi
+    printf 'btw: removed worktree %s\n' "$wt" >&2
+  else
+    git -C "$main" worktree prune
+  fi
+
+  # Delete the branch.
+  if git -C "$main" show-ref --verify --quiet "refs/heads/$slug"; then
+    if [ "$force" -eq 1 ]; then
+      git -C "$main" branch -D "$slug"
+    else
+      git -C "$main" branch -d "$slug" \
+        || die "branch $slug is not fully merged; re-run with -f to force: btw remove -f $slug"
+    fi
+    printf 'btw: deleted branch %s\n' "$slug" >&2
+  fi
+
+  # Kill the tmux session last: if we were invoked from inside this very session,
+  # doing it earlier would SIGHUP this script mid-teardown.
+  if session_exists "$slug"; then
+    printf 'btw: killing tmux session %s\n' "$slug" >&2
+    tmux kill-session -t "=$slug"
+  fi
+}
+
+main() {
+  [ "$#" -ge 1 ] || usage
+  case "$1" in
+    list) shift; [ "$#" -eq 0 ] || usage; cmd_list ;;
+    remove) shift; cmd_remove "$@" ;;
+    -h|--help) usage ;;
+    -*) die "unknown option: $1" ;;
+    *) [ "$#" -eq 1 ] || usage; cmd_create "$1" ;;
+  esac
+}
+
+main "$@"
