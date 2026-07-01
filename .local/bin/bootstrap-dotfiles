@@ -673,7 +673,7 @@ install_debian_dependencies() {
   need_cmd apt-get
   need_cmd dpkg
 
-  install_apt_missing_packages git curl fzf zsh ca-certificates fonts-jetbrains-mono fontconfig ripgrep fd-find build-essential
+  install_apt_missing_packages git curl fzf zsh ca-certificates fonts-jetbrains-mono fontconfig ripgrep fd-find build-essential clangd
   ensure_neovim_linux
   ensure_lazygit_linux
   ensure_tree_sitter_cli_linux
