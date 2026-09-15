@@ -10,6 +10,7 @@
 # Deployment config (set these in your machine-local ~/.zshrc, not in the tracked
 # ~/.zshrc.kalle):
 #   BTW_DEFAULT_REPO   Git repo to use when you run btw outside of any git project.
+#   BTW_WORKTREE_BASE  Canonical checkout/path prefix for new sibling worktrees.
 #   BTW_HARNESS        AI harness command for the bottom pane.  Default: claude
 #   BTW_EDITOR         Editor command for the top pane.          Default: nvim .
 set -euo pipefail
@@ -33,32 +34,101 @@ EOF
   exit 2
 }
 
-# Resolve the git repo to operate on: the current project if we're inside one,
-# otherwise $BTW_DEFAULT_REPO.  Prints the repo's main worktree path.
-resolve_main_worktree() {
+# Resolve two paths independently:
+#   REPO_COMMON   the shared Git directory, which identifies the repository
+#   WORKTREE_BASE the stable checkout/path prefix used for Git commands and for
+#                 naming new sibling worktrees
+#
+# This supports conventional checkouts, standalone bare repositories, and
+# Android repo-style checkouts whose .git is under .repo/projects.
+resolve_repo() {
   local start="$PWD"
-  if git -C "$start" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  if git -C "$start" rev-parse --absolute-git-dir >/dev/null 2>&1; then
     :
   elif [ -n "${BTW_DEFAULT_REPO:-}" ]; then
     [ -d "$BTW_DEFAULT_REPO" ] || die "BTW_DEFAULT_REPO is set but not a directory: $BTW_DEFAULT_REPO"
-    git -C "$BTW_DEFAULT_REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    git -C "$BTW_DEFAULT_REPO" rev-parse --absolute-git-dir >/dev/null 2>&1 \
       || die "BTW_DEFAULT_REPO is not a git repo: $BTW_DEFAULT_REPO"
     start="$BTW_DEFAULT_REPO"
   else
     die "not inside a git project and BTW_DEFAULT_REPO is not set"
   fi
 
-  # git-common-dir points at the shared .git dir; its parent is the main worktree,
-  # even when we're currently sitting inside a linked worktree.
-  local common_dir
-  common_dir="$(git -C "$start" rev-parse --path-format=absolute --git-common-dir)"
-  dirname "$common_dir"
+  REPO_COMMON="$(git -C "$start" rev-parse --path-format=absolute --git-common-dir)" \
+    || die "could not resolve the repository's shared Git directory"
+
+  local base="${BTW_WORKTREE_BASE:-}"
+  if [ -z "$base" ]; then
+    base="$(git -C "$start" config --path --get btw.worktreeBase 2>/dev/null || true)"
+  fi
+
+  if [ -z "$base" ]; then
+    case "$REPO_COMMON" in
+      */.repo/projects/*.git)
+        # Android repo layout:
+        #   <root>/.repo/projects/path/to/project.git -> <root>/path/to/project
+        local repo_root project_path
+        repo_root="${REPO_COMMON%%/.repo/projects/*}"
+        project_path="${REPO_COMMON#"$repo_root/.repo/projects/"}"
+        project_path="${project_path%.git}"
+        base="$repo_root/$project_path"
+        ;;
+      */.git)
+        # Conventional checkout: /path/project/.git -> /path/project
+        base="${REPO_COMMON%/.git}"
+        ;;
+      *)
+        # Standalone bare repository.  Strip an optional .git suffix so a bare
+        # /path/project.git creates siblings such as /path/project.<slug>.
+        base="${REPO_COMMON%.git}"
+        ;;
+    esac
+  fi
+
+  case "$base" in
+    /*) : ;;
+    *) base="$PWD/$base" ;;
+  esac
+  WORKTREE_BASE="$(realpath -m -- "$base")"
+
+  [ -d "$WORKTREE_BASE" ] \
+    || die "resolved worktree base is not a directory: $WORKTREE_BASE (set BTW_WORKTREE_BASE to override)"
+
+  local base_common
+  base_common="$(git -C "$WORKTREE_BASE" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" \
+    || die "resolved worktree base is not a git repo: $WORKTREE_BASE (set BTW_WORKTREE_BASE to override)"
+  [ "$base_common" = "$REPO_COMMON" ] \
+    || die "worktree base belongs to a different git repo: $WORKTREE_BASE (set BTW_WORKTREE_BASE to override)"
 }
 
 # Path a worktree for <slug> would live at: sibling of the main project folder.
 worktree_path_for() {
   local main="$1" slug="$2"
   printf '%s/%s.%s' "$(dirname "$main")" "$(basename "$main")" "$slug"
+}
+
+# Print the registered worktree path whose checked-out branch matches <slug>.
+# Return 1 when the branch is not checked out and 2 when Git cannot list the
+# repository's worktrees.
+registered_worktree_for_branch() {
+  local main="$1" slug="$2" porcelain line wt="" branch
+  porcelain="$(git -C "$main" worktree list --porcelain)" || return 2
+
+  while IFS= read -r line; do
+    case "$line" in
+      worktree\ *) wt="${line#worktree }" ;;
+      branch\ *)
+        branch="${line#branch }"
+        branch="${branch#refs/heads/}"
+        if [ "$branch" = "$slug" ]; then
+          printf '%s\n' "$wt"
+          return 0
+        fi
+        ;;
+    esac
+  done <<< "$porcelain"
+
+  return 1
 }
 
 session_exists() {
@@ -70,7 +140,8 @@ cmd_create() {
   command -v tmux >/dev/null 2>&1 || die "tmux is not installed"
 
   local main wt
-  main="$(resolve_main_worktree)"
+  resolve_repo
+  main="$WORKTREE_BASE"
   wt="$(worktree_path_for "$main" "$slug")"
 
   # Create the worktree + branch if it isn't there yet.
@@ -102,8 +173,10 @@ cmd_create() {
 }
 
 cmd_list() {
-  local main
-  main="$(resolve_main_worktree)"
+  resolve_repo
+  local main="$WORKTREE_BASE" porcelain
+  porcelain="$(git -C "$main" worktree list --porcelain)" \
+    || die "could not list worktrees for $main"
 
   local found=0 line wt branch slug marker
   # Parse porcelain output; skip the main worktree, report the rest.
@@ -114,13 +187,14 @@ cmd_list() {
         branch="${line#branch }"
         branch="${branch#refs/heads/}"
         [ "$wt" = "$main" ] && continue
+        [ "$wt" = "$REPO_COMMON" ] && continue
         slug="$branch"
         if session_exists "$slug"; then marker="tmux"; else marker="----"; fi
         printf '%-4s  %-24s  %s\n' "$marker" "$slug" "$wt"
         found=1
         ;;
     esac
-  done < <(git -C "$main" worktree list --porcelain)
+  done <<< "$porcelain"
 
   [ "$found" -eq 1 ] || printf 'btw: no worktrees\n' >&2
 }
@@ -137,11 +211,24 @@ cmd_remove() {
   [ "$#" -le 1 ] || usage
 
   local main wt slug
-  main="$(resolve_main_worktree)"
+  resolve_repo
+  main="$WORKTREE_BASE"
 
   if [ "$#" -eq 1 ]; then
     slug="$1"
-    wt="$(worktree_path_for "$main" "$slug")"
+    local lookup_rc
+    if wt="$(registered_worktree_for_branch "$main" "$slug")"; then
+      [ "$wt" != "$main" ] \
+        || die "refusing to remove the canonical worktree: $main"
+      [ "$wt" != "$REPO_COMMON" ] \
+        || die "refusing to remove the repository's shared Git directory: $REPO_COMMON"
+    else
+      lookup_rc="$?"
+      [ "$lookup_rc" -eq 1 ] \
+        || die "could not list worktrees while resolving branch: $slug"
+      # Preserve support for an unregistered/stale btw directory.
+      wt="$(worktree_path_for "$main" "$slug")"
+    fi
   else
     # No slug given: infer it from the worktree we're standing in.
     local cur
