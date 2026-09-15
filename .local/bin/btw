@@ -13,6 +13,8 @@
 #   BTW_WORKTREE_BASE  Canonical checkout/path prefix for new sibling worktrees.
 #   BTW_HARNESS        AI harness command for the bottom pane.  Default: claude
 #   BTW_EDITOR         Editor command for the top pane.          Default: nvim .
+#   BTW_BASE_BRANCH    Branch on origin to base new worktrees on.
+#                      Default: origin's default branch (origin/HEAD, or main/master)
 set -euo pipefail
 
 BTW_HARNESS="${BTW_HARNESS:-claude}"
@@ -135,6 +137,27 @@ session_exists() {
   tmux has-session -t "=$1" 2>/dev/null
 }
 
+# The origin ref new branches start from: $BTW_BASE_BRANCH if set, otherwise
+# origin's default branch (via the origin/HEAD symref, falling back to
+# main/master).  Prints nothing if origin has no usable branch.
+base_ref() {
+  local main="$1" ref b
+  if [ -n "${BTW_BASE_BRANCH:-}" ]; then
+    printf 'origin/%s' "$BTW_BASE_BRANCH"
+    return
+  fi
+  if ref="$(git -C "$main" symbolic-ref --quiet --short refs/remotes/origin/HEAD)"; then
+    printf '%s' "$ref"
+    return
+  fi
+  for b in main master; do
+    if git -C "$main" show-ref --verify --quiet "refs/remotes/origin/$b"; then
+      printf 'origin/%s' "$b"
+      return
+    fi
+  done
+}
+
 cmd_create() {
   local slug="$1"
   command -v tmux >/dev/null 2>&1 || die "tmux is not installed"
@@ -150,7 +173,22 @@ cmd_create() {
   elif git -C "$main" show-ref --verify --quiet "refs/heads/$slug"; then
     git -C "$main" worktree add "$wt" "$slug"
   else
-    git -C "$main" worktree add "$wt" -b "$slug"
+    # New branch: base it on a fresh origin default branch when there is an
+    # origin; repos without one fall back to the main checkout's HEAD.
+    local base=""
+    if git -C "$main" remote get-url origin >/dev/null 2>&1; then
+      printf 'btw: fetching origin\n' >&2
+      git -C "$main" fetch origin
+      base="$(base_ref "$main")"
+      [ -n "$base" ] || die "cannot determine base branch on origin; set BTW_BASE_BRANCH"
+      git -C "$main" show-ref --verify --quiet "refs/remotes/$base" \
+        || die "no such branch on origin: $base"
+    fi
+    if [ -n "$base" ]; then
+      git -C "$main" worktree add --no-track "$wt" -b "$slug" "$base"
+    else
+      git -C "$main" worktree add "$wt" -b "$slug"
+    fi
   fi
 
   # Create the tmux session with the dev layout if it isn't there yet.
