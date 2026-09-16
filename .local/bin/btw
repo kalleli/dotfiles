@@ -91,10 +91,10 @@ resolve_repo() {
     /*) : ;;
     *) base="$PWD/$base" ;;
   esac
-  WORKTREE_BASE="$(realpath -m -- "$base")"
-
-  [ -d "$WORKTREE_BASE" ] \
-    || die "resolved worktree base is not a directory: $WORKTREE_BASE (set BTW_WORKTREE_BASE to override)"
+  # Normalize with cd/pwd -P rather than realpath: BSD realpath has no -m, and
+  # the base has to exist anyway.
+  WORKTREE_BASE="$(cd -- "$base" 2>/dev/null && pwd -P)" \
+    || die "resolved worktree base is not a directory: $base (set BTW_WORKTREE_BASE to override)"
 
   local base_common
   base_common="$(git -C "$WORKTREE_BASE" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" \
@@ -133,8 +133,16 @@ registered_worktree_for_branch() {
   return 1
 }
 
+# tmux session name for a slug.  tmux silently rewrites '.' and ':' in session
+# names to '_' (and '.' is its window.pane separator), so a dotted slug like
+# release-notes-1.3 would otherwise create a session our targets never match —
+# and send-keys would land in the caller's current pane.
+session_name_for() {
+  printf '%s' "${1//[.:]/_}"
+}
+
 session_exists() {
-  tmux has-session -t "=$1" 2>/dev/null
+  tmux has-session -t "=$(session_name_for "$1")" 2>/dev/null
 }
 
 # The origin ref new branches start from: $BTW_BASE_BRANCH if set, otherwise
@@ -192,10 +200,12 @@ cmd_create() {
   fi
 
   # Create the tmux session with the dev layout if it isn't there yet.
+  local sess
+  sess="$(session_name_for "$slug")"
   if ! session_exists "$slug"; then
-    tmux new-session -d -s "$slug" -c "$wt" -n dev
+    tmux new-session -d -s "$sess" -c "$wt" -n dev
     local top bottom
-    top="$(tmux display-message -p -t "=$slug:dev" '#{pane_id}')"
+    top="$(tmux display-message -p -t "=$sess:dev" '#{pane_id}')"
     tmux send-keys -t "$top" "$BTW_EDITOR" C-m
     bottom="$(tmux split-window -v -P -F '#{pane_id}' -t "$top" -c "$wt")"
     tmux send-keys -t "$bottom" "$BTW_HARNESS" C-m
@@ -204,9 +214,9 @@ cmd_create() {
 
   # Drop the user into the session.
   if [ -n "${TMUX:-}" ]; then
-    tmux switch-client -t "=$slug"
+    tmux switch-client -t "=$sess"
   else
-    tmux attach-session -t "=$slug"
+    tmux attach-session -t "=$sess"
   fi
 }
 
@@ -307,7 +317,7 @@ cmd_remove() {
   # doing it earlier would SIGHUP this script mid-teardown.
   if session_exists "$slug"; then
     printf 'btw: killing tmux session %s\n' "$slug" >&2
-    tmux kill-session -t "=$slug"
+    tmux kill-session -t "=$(session_name_for "$slug")"
   fi
 }
 
