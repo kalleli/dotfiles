@@ -1093,6 +1093,10 @@ ensure_dotfiles_repo() {
   fi
 
   dotfiles_git config --local status.showUntrackedFiles no
+
+  log "Updating dotfiles submodules"
+  (cd "$DOTFILES_WORK_TREE" && dotfiles_git submodule update --init --recursive)
+
   log "Dotfiles checkout is up to date"
 }
 
