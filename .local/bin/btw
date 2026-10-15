@@ -5,6 +5,9 @@
 #   btw <work_slug> [<base>] Create a git worktree + tmux session and drop into a dev layout
 #                            (new branches start from <base>, e.g. origin/release-1.3;
 #                            default: BTW_BASE_BRANCH or origin's default branch)
+#   btw review [<change>]    Check out a Gerrit change (1234, 1234/3, or a change URL) in
+#                            worktree/session review-<change>.  Re-run it to pull the
+#                            latest patchset (no <change>: the review worktree you're in)
 #   btw list                 List active btw worktrees (and whether a tmux session exists)
 #   btw remove [-f] [<slug>] Tear down the tmux session, worktree folder, and branch
 #                            (slug defaults to the worktree you're currently in)
@@ -32,6 +35,9 @@ usage() {
 Usage:
   btw <work_slug> [<base>] Create a git worktree + tmux session with a dev layout
                            (new branches start from <base>, e.g. origin/release-1.3)
+  btw review [<change>]    Check out a Gerrit change (1234, 1234/3, or its URL);
+                           re-run to pull the latest patchset (no <change>: the
+                           review worktree you're in)
   btw list                 List active btw worktrees
   btw remove [-f] [<slug>] Remove the tmux session, worktree folder, and branch
                            (defaults to the worktree you're currently in)
@@ -228,8 +234,13 @@ cmd_create() {
     fi
   fi
 
-  # Create the tmux session with the dev layout if it isn't there yet.
-  local sess
+  open_session "$slug" "$wt"
+}
+
+# Create the tmux session for <slug> with the dev layout in <wt> if it isn't
+# there yet, then drop the user into it.
+open_session() {
+  local slug="$1" wt="$2" sess
   sess="$(session_name_for "$slug")"
   if ! session_exists "$slug"; then
     tmux new-session -d -s "$sess" -c "$wt" -n dev
@@ -247,6 +258,80 @@ cmd_create() {
   else
     tmux attach-session -t "=$sess"
   fi
+}
+
+# Check out a Gerrit change for review in its own worktree + session, on a
+# branch named review-<change>.  Re-running it moves an untouched review
+# worktree to the requested (default: latest) patchset.
+cmd_review() {
+  local arg="${1:-}" change ps=""
+  command -v tmux >/dev/null 2>&1 || die "tmux is not installed"
+
+  if [ -z "$arg" ]; then
+    # No change given: the review worktree we're standing in.
+    local branch
+    branch="$(git -C "$PWD" symbolic-ref --quiet --short HEAD 2>/dev/null)" \
+      && arg="$(git -C "$PWD" config --get "branch.$branch.btwReview")" \
+      || die "no change given and not inside a btw review worktree"
+  fi
+
+  # Accept 1234, 1234/3, or a change URL such as https://host/c/proj/+/1234/3
+  arg="${arg%/}"
+  arg="${arg##*/+/}"
+  [[ "$arg" =~ ^([0-9]+)(/([0-9]+))?$ ]] || die "not a Gerrit change: $1"
+  change="${BASH_REMATCH[1]}"
+  ps="${BASH_REMATCH[3]}"
+
+  local main
+  resolve_repo
+  main="$WORKTREE_BASE"
+  git -C "$main" remote get-url origin >/dev/null 2>&1 || die "no origin remote to fetch changes from"
+
+  # Gerrit shards change refs by the last two digits: refs/changes/34/1234/<ps>
+  local prefix refs sha
+  prefix="refs/changes/$(printf '%02d' $((10#$change % 100)))/$change"
+  refs="$(git -C "$main" ls-remote origin "$prefix/*")" \
+    || die "could not list patchsets of change $change on origin"
+  # Keep the numbered patchsets only (drops e.g. .../meta), as "<sha> <ps>"
+  refs="$(awk -v p="$prefix/" 'index($2, p) == 1 { ps = substr($2, length(p) + 1); if (ps ~ /^[0-9]+$/) print $1, ps }' <<< "$refs")"
+  [ -n "$refs" ] || die "no such change on origin: $change"
+  if [ -z "$ps" ]; then
+    ps="$(sort -k2,2n <<< "$refs" | tail -n 1 | cut -d' ' -f2)"
+  fi
+  sha="$(awk -v ps="$ps" '$2 == ps { print $1 }' <<< "$refs")"
+  [ -n "$sha" ] || die "change $change has no patchset $ps"
+
+  printf 'btw: fetching change %s patchset %s\n' "$change" "$ps" >&2
+  git -C "$main" fetch --quiet origin "$prefix/$ps"
+
+  local slug="review-$change" wt
+  wt="$(worktree_path_for "$main" "$slug")"
+  if [ -d "$wt" ]; then
+    printf 'btw: reusing existing worktree %s\n' "$wt" >&2
+  elif git -C "$main" show-ref --verify --quiet "refs/heads/$slug"; then
+    git -C "$main" worktree add "$wt" "$slug"
+  else
+    git -C "$main" worktree add "$wt" -b "$slug" "$sha"
+    # Lets `btw remove` delete the unmerged branch: its commits live on Gerrit.
+    git -C "$main" config "branch.$slug.btwReview" "$change"
+  fi
+
+  # Move to the requested patchset, but only while the worktree is a clean
+  # checkout of some patchset of this change -- never over local work.
+  local head
+  head="$(git -C "$wt" rev-parse HEAD)"
+  if [ "$head" != "$sha" ]; then
+    if awk -v h="$head" '$1 == h { found = 1 } END { exit !found }' <<< "$refs" \
+      && [ -z "$(git -C "$wt" status --porcelain)" ]; then
+      git -C "$wt" reset --quiet --keep "$sha"
+      printf 'btw: moved %s to patchset %s\n' "$slug" "$ps" >&2
+    else
+      printf 'btw: %s has local changes or commits; not moving it to patchset %s\n' "$slug" "$ps" >&2
+    fi
+  fi
+  printf 'btw: %s\n' "$(git -C "$wt" log -1 --format='%h %s')" >&2
+
+  open_session "$slug" "$wt"
 }
 
 cmd_list() {
@@ -339,9 +424,10 @@ cmd_remove() {
     git -C "$main" worktree prune
   fi
 
-  # Delete the branch.
+  # Delete the branch.  Review branches are unmerged by nature, but their
+  # commits live on Gerrit, so they don't need -f.
   if git -C "$main" show-ref --verify --quiet "refs/heads/$slug"; then
-    if [ "$force" -eq 1 ]; then
+    if [ "$force" -eq 1 ] || git -C "$main" config --get "branch.$slug.btwReview" >/dev/null; then
       git -C "$main" branch -D "$slug"
     else
       git -C "$main" branch -d "$slug" \
@@ -363,6 +449,7 @@ main() {
   case "$1" in
     list) shift; [ "$#" -eq 0 ] || usage; cmd_list ;;
     remove) shift; cmd_remove "$@" ;;
+    review) shift; [ "$#" -le 1 ] || usage; cmd_review "$@" ;;
     __bases) shift; [ "$#" -eq 0 ] || usage; cmd_bases ;;
     -h|--help) usage ;;
     -*) die "unknown option: $1" ;;

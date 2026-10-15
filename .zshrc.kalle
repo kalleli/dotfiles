@@ -23,7 +23,7 @@ alias dotfiles='git --git-dir=$HOME/.dotfiles/ --work-tree=$HOME'
 #   export BTW_EDITOR="nvim ."                           # top-pane editor
 _btw() {
   local -a subcmds
-  subcmds=(list remove)
+  subcmds=(list remove review)
 
   # Let btw own repository/path resolution; extract the branch slug from its
   # stable, column-oriented list output.
@@ -43,7 +43,12 @@ _btw() {
     # First word: existing slugs (to re-enter) plus the subcommands.
     _btw_slugs
     _describe -t commands 'btw command' subcmds
-  elif (( CURRENT == 3 )) && [[ "$words[2]" != (list|remove|-*) ]]; then
+  elif (( CURRENT == 3 )) && [[ "$words[2]" == review ]]; then
+    #   btw review <TAB>  ->  changes already checked out for review
+    local -a changes
+    changes=(${${(M)${(f)"$(command btw list 2>/dev/null | awk '{print $2}')"}:#review-*}#review-})
+    _describe -t changes 'gerrit change' changes
+  elif (( CURRENT == 3 )) && [[ "$words[2]" != (list|remove|review|-*) ]]; then
     #   btw <slug> <TAB>  ->  origin branches to base the new worktree on
     _btw_bases
   elif [[ "$words[2]" == remove ]]; then
